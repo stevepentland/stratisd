@@ -4,6 +4,7 @@
 
 mod backstore;
 mod cmd;
+mod crypt;
 mod device;
 mod devlinks;
 mod dm;
@@ -12,19 +13,32 @@ mod keys;
 mod liminal;
 mod metadata;
 mod names;
+mod ns;
 mod pool;
 mod serde_structs;
+mod shared;
 mod thinpool;
 mod udev;
 mod writing;
 
+#[cfg(feature = "extras")]
 pub use self::{
-    backstore::{crypt_metadata_size, CLEVIS_TANG_TRUST_URL},
-    device::blkdev_size,
+    backstore::ProcessedPathInfos,
+    pool::{inspection as pool_inspection, v1::StratPool},
+};
+
+pub use self::{
+    backstore::integrity_meta_space,
+    crypt::{
+        register_clevis_token, set_up_crypt_logging, CLEVIS_LUKS_TOKEN_ID, CLEVIS_TANG_TRUST_URL,
+        DEFAULT_CRYPT_DATA_OFFSET_V2, LUKS2_TOKEN_ID,
+    },
     dm::{get_dm, get_dm_init},
     engine::StratEngine,
-    keys::StratKeyActions,
+    keys::{create_process_keyring, StratKeyActions},
     metadata::{StaticHeader, StaticHeaderResult, BDA},
+    ns::unshare_mount_namespace,
+    thinpool::ThinPoolSizeParams,
 };
 
 #[cfg(test)]

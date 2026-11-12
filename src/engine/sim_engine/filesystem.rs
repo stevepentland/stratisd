@@ -9,26 +9,114 @@ use serde_json::{Map, Value};
 
 use devicemapper::{Bytes, Sectors};
 
-use crate::{engine::Filesystem, stratis::StratisResult};
+use crate::{
+    engine::{
+        types::{FilesystemUuid, Name},
+        Filesystem,
+    },
+    stratis::{StratisError, StratisResult},
+};
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+pub struct FilesystemSave {
+    name: String,
+    uuid: FilesystemUuid,
+    size: Sectors,
+    created: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fs_size_limit: Option<Sectors>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<FilesystemUuid>,
+    #[serde(default)]
+    merge: bool,
+}
 
 #[derive(Debug)]
 pub struct SimFilesystem {
     rand: u32,
     created: DateTime<Utc>,
     size: Sectors,
+    size_limit: Option<Sectors>,
+    origin: Option<FilesystemUuid>,
+    merge_scheduled: bool,
 }
 
 impl SimFilesystem {
-    pub fn new(size: Sectors) -> SimFilesystem {
-        SimFilesystem {
+    pub fn new(
+        size: Sectors,
+        size_limit: Option<Sectors>,
+        origin: Option<FilesystemUuid>,
+    ) -> StratisResult<SimFilesystem> {
+        if let Some(limit) = size_limit {
+            if limit < size {
+                return Err(StratisError::Msg(format!(
+                    "Limit of {limit} is less than requested size {size}"
+                )));
+            }
+        }
+        Ok(SimFilesystem {
             rand: rand::random::<u32>(),
             created: Utc::now(),
             size,
-        }
+            size_limit,
+            origin,
+            merge_scheduled: false,
+        })
     }
 
     pub fn size(&self) -> Sectors {
         self.size
+    }
+
+    /// Set the size limit for the SimFilesystem.
+    pub fn set_size_limit(&mut self, limit: Option<Sectors>) -> StratisResult<bool> {
+        match limit {
+            Some(lim) if self.size() > lim => Err(StratisError::Msg(format!(
+                "Limit requested of {} is smaller than current filesystem size of {}",
+                lim,
+                self.size()
+            ))),
+            Some(_) | None => {
+                if self.size_limit == limit {
+                    Ok(false)
+                } else {
+                    self.size_limit = limit;
+                    Ok(true)
+                }
+            }
+        }
+    }
+
+    pub fn set_origin(&mut self, value: Option<FilesystemUuid>) -> bool {
+        let changed = self.origin != value;
+        self.origin = value;
+        changed
+    }
+
+    pub fn record(&self, name: &Name, uuid: FilesystemUuid) -> FilesystemSave {
+        FilesystemSave {
+            name: name.to_owned(),
+            uuid,
+            size: self.size,
+            created: self.created.timestamp() as u64,
+            fs_size_limit: self.size_limit,
+            origin: self.origin,
+            merge: self.merge_scheduled,
+        }
+    }
+
+    /// Set the merge scheduled value for the filesystem.
+    pub fn set_merge_scheduled(&mut self, scheduled: bool) -> StratisResult<bool> {
+        if self.merge_scheduled == scheduled {
+            Ok(false)
+        } else if scheduled && self.origin.is_none() {
+            Err(StratisError::Msg(
+                "Filesystem has no origin filesystem; can not schedule a merge".into(),
+            ))
+        } else {
+            self.merge_scheduled = scheduled;
+            Ok(true)
+        }
     }
 }
 
@@ -44,7 +132,7 @@ impl Filesystem for SimFilesystem {
     }
 
     fn path_to_mount_filesystem(&self, pool_name: &str, fs_name: &str) -> PathBuf {
-        vec!["/somepath", pool_name, fs_name].iter().collect()
+        ["/somepath", pool_name, fs_name].iter().collect()
     }
 
     fn used(&self) -> StratisResult<Bytes> {
@@ -54,9 +142,21 @@ impl Filesystem for SimFilesystem {
     fn size(&self) -> Bytes {
         self.size.bytes()
     }
+
+    fn size_limit(&self) -> Option<Sectors> {
+        self.size_limit
+    }
+
+    fn origin(&self) -> Option<FilesystemUuid> {
+        self.origin
+    }
+
+    fn merge_scheduled(&self) -> bool {
+        self.merge_scheduled
+    }
 }
 
-impl<'a> Into<Value> for &'a SimFilesystem {
+impl Into<Value> for &SimFilesystem {
     fn into(self) -> Value {
         let mut json = Map::new();
         json.insert("size".to_string(), Value::from(self.size().to_string()));
@@ -66,6 +166,24 @@ impl<'a> Into<Value> for &'a SimFilesystem {
                 self.used()
                     .map(|v| v.to_string())
                     .unwrap_or_else(|_| "Unavailable".to_string()),
+            ),
+        );
+        json.insert(
+            "size_limit".to_string(),
+            Value::from(
+                self.size_limit
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "Not set".to_string()),
+            ),
+        );
+        json.insert(
+            "origin".to_string(),
+            Value::from(
+                self.origin
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "Not set".to_string()),
             ),
         );
         Value::from(json)

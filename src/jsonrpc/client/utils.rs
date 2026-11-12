@@ -2,6 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+use std::{
+    io::{stdin, stdout, Write},
+    os::unix::io::AsRawFd,
+};
+
+use nix::unistd::isatty;
+use termios::{tcsetattr, Termios, ECHO, ECHONL, TCSADRAIN};
+
+use crate::stratis::{StratisError, StratisResult};
+
 #[macro_export]
 macro_rules! do_request {
     ($request:ident, $($arg:expr),+; $fd:expr) => {{
@@ -14,7 +24,7 @@ macro_rules! do_request {
                 ),
                 fd_opt: Some($fd),
             }
-        )? {
+        )?.map_err($crate::stratis::StratisError::Msg)? {
             ret
         } else {
             return Err($crate::stratis::StratisError::Msg(
@@ -32,7 +42,7 @@ macro_rules! do_request {
                 ),
                 fd_opt: None,
             }
-        )? {
+        )?.map_err($crate::stratis::StratisError::Msg)? {
             ret
         } else {
             return Err($crate::stratis::StratisError::Msg(
@@ -48,7 +58,7 @@ macro_rules! do_request {
                 type_: $crate::jsonrpc::interface::StratisParamType::$request,
                 fd_opt: None,
             }
-        )? {
+        )?.map_err($crate::stratis::StratisError::Msg)? {
             ret
         } else {
             return Err($crate::stratis::StratisError::Msg(
@@ -205,6 +215,53 @@ pub fn to_suffix_repr(size: u128) -> String {
             acc
         }
     })
+}
+
+fn get_pass(prompt: &str) -> StratisResult<Option<String>> {
+    print!("{prompt}");
+    stdout().flush()?;
+
+    let stdin = stdin();
+    let istty = isatty(&stdin).unwrap_or(false);
+
+    let mut password = String::new();
+    if istty {
+        let current = Termios::from_fd(stdin.as_raw_fd())?;
+        let mut new = current;
+        new.c_lflag &= !ECHO;
+        new.c_lflag |= ECHONL;
+        tcsetattr(stdin.as_raw_fd(), TCSADRAIN, &new)?;
+
+        let res = stdin.read_line(&mut password);
+
+        if let Err(e) = tcsetattr(stdin.as_raw_fd(), TCSADRAIN, &current) {
+            eprintln!("Failed to set terminal settings back to original state: {e}");
+        }
+        res?;
+    } else {
+        stdin.read_line(&mut password)?;
+    }
+
+    let password = password.trim_end_matches('\n');
+
+    if password.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(password.to_string()))
+    }
+}
+
+pub fn prompt_password(verify: bool) -> StratisResult<Option<String>> {
+    let password = get_pass("Enter passphrase followed by return: ")?;
+
+    if verify {
+        let password_2 = get_pass("Verify passphrase: ")?;
+        if password != password_2 {
+            return Err(StratisError::Msg("Passphrases did not match".to_string()));
+        }
+    }
+
+    Ok(password)
 }
 
 #[cfg(test)]

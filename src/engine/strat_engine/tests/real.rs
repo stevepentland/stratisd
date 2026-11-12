@@ -3,10 +3,11 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::{
-    cmp,
+    cmp, env,
     fs::OpenOptions,
     panic,
     path::{Path, PathBuf},
+    sync::Once,
 };
 
 use either::Either;
@@ -19,11 +20,15 @@ use devicemapper::{
 };
 
 use crate::engine::strat_engine::{
+    cmd::udev_settle,
+    crypt::register_clevis_token,
     device::blkdev_size,
     dm::get_dm,
     tests::{logger::init_logger, util::clean_up},
     writing::wipe_sectors,
 };
+
+static CLEVIS_TOKEN_HANDLER: Once = Once::new();
 
 pub struct RealTestDev {
     dev: Either<PathBuf, LinearDev>,
@@ -50,7 +55,8 @@ impl RealTestDev {
 
     /// Teardown a real test dev
     fn teardown(self) {
-        wipe_sectors(&self.as_path(), Sectors(0), Bytes::from(IEC::Mi).sectors()).unwrap();
+        wipe_sectors(self.as_path(), Sectors(0), Bytes::from(IEC::Mi).sectors()).unwrap();
+        udev_settle().unwrap();
         if let Some(mut ld) = self.dev.right() {
             ld.teardown(get_dm()).unwrap();
         }
@@ -74,7 +80,6 @@ pub enum DeviceLimits {
     /// of devices available in the second argument.
     /// The third argument is the minimum size for all devices.
     /// The fourth argument is the maximum size for all devices.
-    #[allow(dead_code)]
     Range(usize, usize, Option<Sectors>, Option<Sectors>),
 }
 
@@ -112,16 +117,15 @@ fn get_device_runs<'a>(
 
     // Retain only devices that are less than max_size
     let (mut matches, mut too_large): (Vec<(&Path, Sectors)>, Vec<(&Path, Sectors)>) =
-        if max_size.is_none() {
-            (matches, vec![])
-        } else {
-            let max_size = max_size.expect("!max_size.is_none()");
+        if let Some(max_size) = max_size {
             matches.iter().partition(|&&(_, s)| s <= max_size)
+        } else {
+            (matches, vec![])
         };
 
     let avail = matches.len();
     let needed = maybe_upper.unwrap_or(lower);
-    let must_generate = if avail > needed { 0 } else { needed - avail };
+    let must_generate = needed.saturating_sub(avail);
     let avail_specs = {
         let mut avail_specs = vec![];
         while avail_specs.len() < must_generate && (!too_large.is_empty() || !matches.is_empty()) {
@@ -228,6 +232,7 @@ where
     assert!(!runs.is_empty());
 
     init_logger();
+    CLEVIS_TOKEN_HANDLER.call_once(|| register_clevis_token().unwrap());
 
     for run_paths in runs {
         clean_up().unwrap();
@@ -245,13 +250,23 @@ where
         let paths: Vec<PathBuf> = devices.iter().map(|x| x.as_path()).collect();
         let paths: Vec<&Path> = paths.iter().map(|x| x.as_path()).collect();
         let result = panic::catch_unwind(|| test(&paths));
-        let tear_down = clean_up();
+
+        let tear_down = if env::var("NO_TEST_CLEAN_UP") != Ok("1".to_string()) {
+            Some(clean_up())
+        } else {
+            None
+        };
 
         result.unwrap();
-        tear_down.unwrap();
 
-        for dev in devices.drain(..) {
-            dev.teardown();
+        if let Some(td) = tear_down {
+            td.unwrap();
+        }
+
+        if env::var("NO_TEST_CLEAN_UP") != Ok("1".to_string()) {
+            for dev in devices.drain(..) {
+                dev.teardown();
+            }
         }
     }
 }

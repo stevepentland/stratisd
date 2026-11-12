@@ -4,44 +4,60 @@
 
 use std::{
     borrow::Borrow,
-    collections::HashMap,
-    convert::TryFrom,
+    collections::{HashMap, HashSet},
     ffi::OsStr,
     fmt::{self, Debug, Display},
     hash::Hash,
+    iter::once,
     ops::Deref,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use libudev::EventType;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use tokio::sync::Mutex;
+use strum_macros::{self, AsRefStr, EnumString, FromRepr, VariantNames};
 use uuid::Uuid;
+#[cfg(feature = "dbus_enabled")]
+use zbus::zvariant::{Type, Value};
 
-use devicemapper::Bytes;
+use devicemapper::{Bytes, Sectors, IEC};
 
-pub use crate::engine::{
-    engine::{Engine, StateDiff},
-    structures::Lockable,
-    types::{
-        actions::{
-            Clevis, CreateAction, DeleteAction, EngineAction, Key, MappingCreateAction,
-            MappingDeleteAction, RegenAction, RenameAction, SetCreateAction, SetDeleteAction,
-            SetUnlockAction,
+pub use crate::{
+    engine::{
+        engine::StateDiff,
+        structures::Lockable,
+        types::{
+            actions::{
+                Clevis, CreateAction, DeleteAction, EncryptedDevice, EngineAction, GrowAction, Key,
+                MappingCreateAction, MappingDeleteAction, PropChangeAction, ReencryptedDevice,
+                RegenAction, RenameAction, SetCreateAction, SetDeleteAction, SetUnlockAction,
+                StartAction, StopAction, ToDisplay,
+            },
+            diff::{
+                Compare, Diff, PoolDiff, StratBlockDevDiff, StratFilesystemDiff, StratPoolDiff,
+                ThinPoolDiff,
+            },
+            keys::{
+                EncryptionInfo, InputEncryptionInfo, KeyDescription, OptionalTokenSlotInput,
+                PoolEncryptionInfo, SizedKeyMemory, TokenUnlockMethod, UnlockMechanism,
+                UnlockMethod, VolumeKeyKeyDescription,
+            },
         },
-        keys::{EncryptionInfo, KeyDescription, PoolEncryptionInfo, SizedKeyMemory},
     },
+    stratis::{StratisError, StratisResult},
 };
-use crate::stratis::{StratisError, StratisResult};
+
+pub const DEFAULT_INTEGRITY_JOURNAL_SIZE: Bytes = Bytes(128 * IEC::Mi as u128);
+pub const DEFAULT_INTEGRITY_BLOCK_SIZE: Bytes = Bytes(4 * IEC::Ki as u128);
+pub const DEFAULT_INTEGRITY_TAG_SPEC: IntegrityTagSpec = IntegrityTagSpec::B512;
 
 mod actions;
+mod diff;
 mod keys;
 
 macro_rules! uuid {
     ($vis:vis $ident:ident) => {
-        #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, Deserialize, Serialize)]
+        #[derive(Copy, Clone, Debug, Default, Hash, Eq, PartialEq, Deserialize, Serialize, Ord, PartialOrd)]
         $vis struct $ident(pub uuid::Uuid);
 
         impl $ident {
@@ -77,10 +93,7 @@ macro_rules! uuid {
 }
 
 /// Value representing Clevis config information.
-pub type ClevisInfo = (String, Value);
-
-/// An engine that can be locked for synchronization.
-pub type LockableEngine<E> = Lockable<Arc<Mutex<E>>>;
+pub type ClevisInfo = (String, serde_json::Value);
 
 pub trait AsUuid:
     Copy
@@ -102,7 +115,7 @@ uuid!(pub FilesystemUuid);
 
 uuid!(pub PoolUuid);
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum StratisUuid {
     Dev(DevUuid),
     Fs(FilesystemUuid),
@@ -114,9 +127,9 @@ impl Deref for StratisUuid {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            StratisUuid::Dev(d) => &*d,
-            StratisUuid::Fs(f) => &*f,
-            StratisUuid::Pool(p) => &*p,
+            StratisUuid::Dev(d) => d,
+            StratisUuid::Fs(f) => f,
+            StratisUuid::Pool(p) => p,
         }
     }
 }
@@ -131,28 +144,6 @@ impl Display for StratisUuid {
     }
 }
 
-/// Use Clevis or keyring to unlock LUKS volume.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
-pub enum UnlockMethod {
-    Clevis,
-    Keyring,
-}
-
-impl<'a> TryFrom<&'a str> for UnlockMethod {
-    type Error = StratisError;
-
-    fn try_from(s: &str) -> StratisResult<UnlockMethod> {
-        match s {
-            "keyring" => Ok(UnlockMethod::Keyring),
-            "clevis" => Ok(UnlockMethod::Clevis),
-            _ => Err(StratisError::Msg(format!(
-                "{} is an invalid unlock method",
-                s
-            ))),
-        }
-    }
-}
-
 /// Blockdev tier. Used to distinguish between blockdevs used for
 /// data and blockdevs used for a cache.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,15 +152,12 @@ pub enum BlockDevTier {
     Cache = 1,
 }
 
-/// Redundancy classifications which the engine allows for pools.
-#[derive(Debug, Eq, PartialEq)]
-#[allow(non_camel_case_types)]
-/// Redundancy specification for a pool.
-pub enum Redundancy {
-    NONE = 0,
-}
-
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[cfg_attr(
+    feature = "dbus_enabled",
+    derive(Type, Value),
+    zvariant(signature = "s")
+)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
 pub struct Name(String);
 
 impl Name {
@@ -214,35 +202,57 @@ impl fmt::Display for Name {
 /// This report may be fetched through `Report::engine_state_report()`.
 ///
 /// * `ErroredPoolDevices` returns the state of devices that caused an error while
-/// attempting to reconstruct a pool.
+///   attempting to reconstruct a pool.
+#[derive(EnumString)]
+#[strum(serialize_all = "snake_case")]
 pub enum ReportType {
-    ErroredPoolDevices,
+    StoppedPools,
 }
 
-impl<'a> TryFrom<&'a str> for ReportType {
-    type Error = StratisError;
-
-    fn try_from(name: &str) -> StratisResult<ReportType> {
-        match name {
-            "errored_pool_report" => Ok(ReportType::ErroredPoolDevices),
-            _ => Err(StratisError::Msg(format!(
-                "Report name {} not understood",
-                name
-            ))),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub struct LockedPoolDevice {
+#[derive(Debug, Eq, PartialEq)]
+pub struct PoolDevice {
     pub devnode: PathBuf,
     pub uuid: DevUuid,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct LockedPoolInfo {
     pub info: PoolEncryptionInfo,
-    pub devices: Vec<LockedPoolDevice>,
+    pub devices: Vec<PoolDevice>,
+}
+
+#[derive(Default, Debug, Eq, PartialEq)]
+pub struct LockedPoolsInfo {
+    pub locked: HashMap<PoolUuid, LockedPoolInfo>,
+    pub name_to_uuid: HashMap<Name, PoolUuid>,
+    pub uuid_to_name: HashMap<PoolUuid, Name>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct StoppedPoolInfo {
+    pub info: Option<PoolEncryptionInfo>,
+    pub devices: Vec<PoolDevice>,
+    pub metadata_version: Option<StratSigblockVersion>,
+    pub features: Option<Features>,
+    /// True if the devices found match the complete set of devices recorded
+    /// in the pool metadata. False if some devices are missing or if this
+    /// cannot be determined, e.g., because some devices are not yet unlocked.
+    pub devices_complete: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct Features {
+    pub encryption: bool,
+    pub key_description_enabled: bool,
+    pub clevis_enabled: bool,
+}
+
+#[derive(Default, Debug, Eq, PartialEq)]
+pub struct StoppedPoolsInfo {
+    pub stopped: HashMap<PoolUuid, StoppedPoolInfo>,
+    pub partially_constructed: HashMap<PoolUuid, StoppedPoolInfo>,
+    pub name_to_uuid: HashMap<Name, PoolUuid>,
+    pub uuid_to_name: HashMap<PoolUuid, Name>,
 }
 
 /// A sendable event with all of the necessary information for the engine
@@ -253,6 +263,11 @@ pub struct UdevEngineEvent {
 }
 
 impl UdevEngineEvent {
+    #[cfg(test)]
+    pub fn new(event_type: EventType, device: UdevEngineDevice) -> Self {
+        UdevEngineEvent { event_type, device }
+    }
+
     pub fn event_type(&self) -> EventType {
         self.event_type
     }
@@ -262,8 +277,8 @@ impl UdevEngineEvent {
     }
 }
 
-impl<'a> From<&'a libudev::Event<'a>> for UdevEngineEvent {
-    fn from(e: &'a libudev::Event<'a>) -> UdevEngineEvent {
+impl From<&libudev::Event> for UdevEngineEvent {
+    fn from(e: &libudev::Event) -> UdevEngineEvent {
         UdevEngineEvent {
             event_type: e.event_type(),
             device: UdevEngineDevice::from(e.device()),
@@ -281,6 +296,21 @@ pub struct UdevEngineDevice {
 }
 
 impl UdevEngineDevice {
+    #[cfg(test)]
+    pub fn new(
+        is_initialized: bool,
+        devnode: Option<PathBuf>,
+        devnum: Option<libc::dev_t>,
+        properties: HashMap<Box<OsStr>, Box<OsStr>>,
+    ) -> Self {
+        UdevEngineDevice {
+            is_initialized,
+            devnode,
+            devnum,
+            properties,
+        }
+    }
+
     pub fn is_initialized(&self) -> bool {
         self.is_initialized
     }
@@ -293,18 +323,29 @@ impl UdevEngineDevice {
         self.devnum
     }
 
-    pub fn property_value<T>(&self, property_name: T) -> Option<&OsStr>
+    pub fn property_value<T>(&self, property_name: T) -> Option<StratisResult<&str>>
     where
-        T: AsRef<OsStr>,
+        T: AsRef<OsStr> + Display,
     {
         self.properties
             .get(property_name.as_ref())
-            .map(|prop| &**prop)
+            .map(|value| {
+                value.to_str()
+                    .ok_or_else(|| {
+                        StratisError::Msg(
+                            format!(
+                                "Unable to convert udev property value with key {} to a string, lossy value is {}",
+                                property_name,
+                                value.to_string_lossy()
+                            ),
+                        )
+                    })
+            })
     }
 }
 
-impl<'a> From<&'a libudev::Device<'a>> for UdevEngineDevice {
-    fn from(d: &'a libudev::Device<'a>) -> UdevEngineDevice {
+impl From<&libudev::Device> for UdevEngineDevice {
+    fn from(d: &libudev::Device) -> UdevEngineDevice {
         UdevEngineDevice {
             is_initialized: d.is_initialized(),
             devnode: d.devnode().map(|p| p.to_owned()),
@@ -335,29 +376,18 @@ impl Deref for DevicePath {
 }
 
 /// Represents what actions this pool can accept.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, strum_macros::Display)]
 pub enum ActionAvailability {
     /// Full set of actions may be taken
+    #[strum(serialize = "fully_operational")]
     Full = 0,
     /// No requests via an IPC mechanism may be taken
+    #[strum(serialize = "no_ipc_requests")]
     NoRequests = 1,
     /// No changes may be made to the pool including background changes
     /// like reacting to devicemapper events
+    #[strum(serialize = "no_pool_changes")]
     NoPoolChanges = 2,
-}
-
-impl Display for ActionAvailability {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                ActionAvailability::Full => "fully_operational",
-                ActionAvailability::NoRequests => "no_ipc_requests",
-                ActionAvailability::NoPoolChanges => "no_pool_changes",
-            }
-        )
-    }
 }
 
 /// Indicates that a property that should be consistent across block devices
@@ -368,33 +398,227 @@ pub enum MaybeInconsistent<T> {
     No(T),
 }
 
-/// Change in attributes of the thin pool that may need to be reported to the
-/// IPC layer.
-#[derive(Default, Debug)]
-pub struct ThinPoolDiff {
-    #[allow(clippy::option_option)]
-    pub usage: Option<Option<Bytes>>,
-    pub allocated_size: Option<Bytes>,
-}
-
-impl ThinPoolDiff {
-    /// Returns true if the thin pool information has changed.
-    pub fn is_changed(&self) -> bool {
-        self.usage.is_some() || self.allocated_size.is_some()
+impl<T> MaybeInconsistent<Option<T>> {
+    pub fn as_ref(&self) -> MaybeInconsistent<Option<&T>> {
+        match self {
+            MaybeInconsistent::Yes => MaybeInconsistent::Yes,
+            MaybeInconsistent::No(opt) => MaybeInconsistent::No(opt.as_ref()),
+        }
     }
 }
 
-/// Represents the difference between two dumped states for a filesystem.
-#[derive(Default, Debug)]
-pub struct StratFilesystemDiff {
-    pub size: Option<Bytes>,
-    #[allow(clippy::option_option)]
-    pub used: Option<Option<Bytes>>,
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PoolIdentifier<U> {
+    Name(Name),
+    Uuid(U),
 }
 
-impl StratFilesystemDiff {
-    /// Returns true if the filesystem information has changed.
-    pub fn is_changed(&self) -> bool {
-        self.size.is_some() || self.used.is_some()
+impl<U> Display for PoolIdentifier<U>
+where
+    U: Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PoolIdentifier::Name(n) => write!(f, "name {n}"),
+            PoolIdentifier::Uuid(u) => write!(f, "UUID {u}"),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum UuidOrConflict {
+    Uuid(PoolUuid),
+    Conflict(HashSet<PoolUuid>),
+}
+
+impl UuidOrConflict {
+    fn invariant(&self) -> bool {
+        if let UuidOrConflict::Conflict(set) = self {
+            set.len() > 1
+        } else {
+            true
+        }
+    }
+
+    /// Returns Ok(_) if no conflict was found and Err(_) otherwise.
+    pub fn to_result(&self) -> StratisResult<PoolUuid> {
+        assert!(self.invariant());
+        match self {
+            UuidOrConflict::Uuid(u) => Ok(*u),
+            UuidOrConflict::Conflict(set) => Err(StratisError::Msg(format!(
+                "Found conflicting UUIDs for the same pool name: {}; please use UUID for operation",
+                set.iter()
+                    .map(|u| u.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    }
+
+    /// Add a UUID to the set of conflicts.
+    pub fn add(&mut self, uuid: PoolUuid) {
+        assert!(self.invariant());
+        match self {
+            UuidOrConflict::Uuid(u) => {
+                if *u != uuid {
+                    *self = UuidOrConflict::Conflict(
+                        once(*u).chain(once(uuid)).collect::<HashSet<_>>(),
+                    );
+                }
+            }
+            UuidOrConflict::Conflict(set) => {
+                set.insert(uuid);
+            }
+        }
+    }
+
+    /// Remove a UUID from the set of conflicts. If remove() returns true, the
+    /// entire entry should be removed from the HashMap containing names and
+    /// potential UUID conflicts.
+    pub fn remove(&mut self, uuid: &PoolUuid) -> bool {
+        assert!(self.invariant());
+        match self {
+            UuidOrConflict::Uuid(u) => u == uuid,
+            UuidOrConflict::Conflict(set) => {
+                set.remove(uuid);
+                if set.len() == 1 {
+                    let last_elem = set.drain().next().expect("Some(_) checked above");
+                    *self = UuidOrConflict::Uuid(last_elem);
+                }
+                false
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, FromRepr)]
+#[repr(u8)]
+pub enum StratSigblockVersion {
+    V1 = 1,
+    V2 = 2,
+}
+
+impl TryFrom<u8> for StratSigblockVersion {
+    type Error = StratisError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1u8 => Ok(StratSigblockVersion::V1),
+            2u8 => Ok(StratSigblockVersion::V2),
+            _ => Err(StratisError::Msg(format!(
+                "Unknown sigblock version: {value}"
+            ))),
+        }
+    }
+}
+
+impl From<StratSigblockVersion> for u8 {
+    fn from(version: StratSigblockVersion) -> Self {
+        match version {
+            StratSigblockVersion::V1 => 1u8,
+            StratSigblockVersion::V2 => 2u8,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum OffsetDirection {
+    /// Subtract the offset from the current offset.
+    Backwards,
+    /// Add the offset to the current offset.
+    Forwards,
+}
+
+/// A way to specify an integrity tag size. It is possible for the specification
+/// to be non-numeric but translatable to some number of bits.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Hash,
+    Serialize,
+    Deserialize,
+    VariantNames,
+    EnumString,
+    AsRefStr,
+)]
+pub enum IntegrityTagSpec {
+    #[strum(serialize = "0b")]
+    #[serde(rename = "0b")]
+    B0,
+    #[strum(serialize = "32b")]
+    #[serde(rename = "32b")]
+    B32,
+    #[strum(serialize = "512b")]
+    #[serde(rename = "512b")]
+    B512,
+}
+
+impl IntegrityTagSpec {
+    /// The smallest number of bytes containing the bits represented.
+    pub fn as_bytes_ceil(self) -> Bytes {
+        match self {
+            IntegrityTagSpec::B0 => Bytes(0),
+            IntegrityTagSpec::B32 => Bytes(4),
+            IntegrityTagSpec::B512 => Bytes(64),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct IntegritySpec {
+    pub tag_spec: Option<IntegrityTagSpec>,
+    pub journal_size: Option<Bytes>,
+    pub allocate_superblock: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ValidatedIntegritySpec {
+    pub tag_spec: IntegrityTagSpec,
+    pub journal_size: Sectors,
+    pub block_size: Bytes,
+    pub allocate_superblock: bool,
+}
+
+impl Default for ValidatedIntegritySpec {
+    fn default() -> Self {
+        ValidatedIntegritySpec::try_from(IntegritySpec::default()).expect("default is valid")
+    }
+}
+
+impl TryFrom<IntegritySpec> for ValidatedIntegritySpec {
+    type Error = StratisError;
+
+    fn try_from(spec: IntegritySpec) -> StratisResult<Self> {
+        let journal_size = match spec.journal_size {
+            Some(journal_size) => {
+                if journal_size % 4096u64 != Bytes(0) {
+                    return Err(StratisError::Msg(format!(
+                        "specified integrity journal size {journal_size} is not a multiple of 4096"
+                    )));
+                } else {
+                    journal_size.sectors()
+                }
+            }
+            None => DEFAULT_INTEGRITY_JOURNAL_SIZE.sectors(),
+        };
+
+        Ok(ValidatedIntegritySpec {
+            journal_size,
+            tag_spec: spec.tag_spec.unwrap_or(DEFAULT_INTEGRITY_TAG_SPEC),
+            block_size: DEFAULT_INTEGRITY_BLOCK_SIZE,
+            allocate_superblock: spec.allocate_superblock.unwrap_or(true),
+        })
+    }
+}
+
+impl Display for ValidatedIntegritySpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Allocate Superblock: {}", self.allocate_superblock)?;
+        writeln!(f, "Tag Specification: {}", self.tag_spec.as_ref())?;
+        writeln!(f, "Journal Size: {}", self.journal_size)?;
+        writeln!(f, "Block Size: {}", self.block_size)
     }
 }

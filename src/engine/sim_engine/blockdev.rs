@@ -4,14 +4,15 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 
 use devicemapper::{Bytes, Sectors, IEC};
 
 use crate::engine::{
     engine::BlockDev,
-    types::{DevUuid, EncryptionInfo, KeyDescription},
+    shared::now_to_timestamp,
+    types::{DevUuid, StratSigblockVersion},
 };
 
 #[derive(Debug)]
@@ -20,8 +21,7 @@ pub struct SimDev {
     devnode: PathBuf,
     user_info: Option<String>,
     hardware_info: Option<String>,
-    initialization_time: u64,
-    encryption_info: Option<EncryptionInfo>,
+    initialization_time: DateTime<Utc>,
 }
 
 impl SimDev {
@@ -49,29 +49,32 @@ impl BlockDev for SimDev {
     }
 
     fn initialization_time(&self) -> DateTime<Utc> {
-        Utc.timestamp(self.initialization_time as i64, 0)
+        self.initialization_time
     }
 
     fn size(&self) -> Sectors {
         Bytes::from(IEC::Gi).sectors()
     }
 
-    fn is_encrypted(&self) -> bool {
-        self.encryption_info.is_some()
+    fn new_size(&self) -> Option<Sectors> {
+        None
+    }
+
+    fn metadata_version(&self) -> StratSigblockVersion {
+        StratSigblockVersion::V2
     }
 }
 
 impl SimDev {
     /// Generates a new device from any devnode.
-    pub fn new(devnode: &Path, encryption_info: Option<&EncryptionInfo>) -> (DevUuid, SimDev) {
+    pub fn new(devnode: &Path) -> (DevUuid, SimDev) {
         (
             DevUuid::new_v4(),
             SimDev {
                 devnode: devnode.to_owned(),
                 user_info: None,
                 hardware_info: None,
-                initialization_time: Utc::now().timestamp() as u64,
-                encryption_info: encryption_info.cloned(),
+                initialization_time: now_to_timestamp(),
             },
         )
     }
@@ -82,64 +85,16 @@ impl SimDev {
     pub fn set_user_info(&mut self, user_info: Option<&str>) -> bool {
         set_blockdev_user_info!(self; user_info)
     }
-
-    /// Set the clevis info for a block device.
-    pub fn set_clevis_info(&mut self, pin: &str, config: &Value) {
-        self.encryption_info = self
-            .encryption_info
-            .take()
-            .map(|ei| ei.set_clevis_info((pin.to_owned(), config.clone())));
-    }
-
-    /// Unset the clevis info for a block device.
-    pub fn unset_clevis_info(&mut self) {
-        self.encryption_info = self.encryption_info.take().map(|ei| ei.unset_clevis_info());
-    }
-
-    /// Set the key description for a block device.
-    pub fn set_key_desc(&mut self, key_desc: &KeyDescription) {
-        self.encryption_info = self
-            .encryption_info
-            .take()
-            .map(|ei| ei.set_key_desc(key_desc.clone()))
-    }
-
-    /// Unset the key description for a block device.
-    pub fn unset_key_desc(&mut self) {
-        self.encryption_info = self.encryption_info.take().map(|ei| ei.unset_key_desc())
-    }
-
-    /// Get encryption information for this block device.
-    pub fn encryption_info(&self) -> Option<&EncryptionInfo> {
-        self.encryption_info.as_ref()
-    }
 }
 
-impl<'a> Into<Value> for &'a SimDev {
+impl Into<Value> for &SimDev {
     fn into(self) -> Value {
         let mut json = Map::new();
         json.insert(
             "path".to_string(),
             Value::from(self.devnode.display().to_string()),
         );
-        if let Some(EncryptionInfo::Both(kd, (pin, config))) = self.encryption_info.as_ref() {
-            json.insert(
-                "key_description".to_string(),
-                Value::from(kd.as_application_str()),
-            );
-            json.insert("clevis_pin".to_string(), Value::from(pin.to_owned()));
-            json.insert("clevis_config".to_string(), config.to_owned());
-        } else if let Some(EncryptionInfo::KeyDesc(kd)) = self.encryption_info.as_ref() {
-            json.insert(
-                "key_description".to_string(),
-                Value::from(kd.as_application_str()),
-            );
-        } else if let Some(EncryptionInfo::ClevisInfo((pin, config))) =
-            self.encryption_info.as_ref()
-        {
-            json.insert("clevis_pin".to_string(), Value::from(pin.to_owned()));
-            json.insert("clevis_config".to_string(), config.to_owned());
-        }
+        json.insert("size".to_string(), Value::from(self.size().to_string()));
         Value::from(json)
     }
 }

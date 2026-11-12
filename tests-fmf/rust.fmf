@@ -1,0 +1,25 @@
+path: /
+duration: 30m
+tag: rust
+
+require:
+  - cargo
+  - clang
+  - clevis-luks
+  - cryptsetup-devel
+  - libblkid-devel
+  - make
+  - python3-dbus
+  - python3-dbus-client-gen
+  - python3-dbus-python-client-gen
+  - python3-psutil
+  - python3-pyudev
+  - rust
+  - systemd-devel
+
+environment:
+  TANG_URL: localhost
+
+/loop:
+  test: make -f Makefile test-clevis-loop
+  summary: Run Rust tests that use loopbacked device framework for Clevis

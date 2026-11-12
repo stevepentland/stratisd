@@ -6,30 +6,37 @@
 
 use std::{
     convert::From,
-    fs::{create_dir, create_dir_all, read_dir, remove_dir, remove_file, rename, OpenOptions},
-    io::{prelude::*, ErrorKind},
+    fs::{
+        create_dir, create_dir_all, read_dir, remove_dir, remove_file, rename, File, OpenOptions,
+    },
+    io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
 };
 
-use nix::mount::{mount, umount, MsFlags};
+use nix::{
+    mount::{mount, umount, MsFlags},
+    sys::stat::stat,
+};
+use retry::{delay::Fixed, retry_with_index};
 
-use devicemapper::{DmDevice, DmOptions, LinearDev, LinearDevTargetParams, TargetLine};
+use devicemapper::{
+    DevId, DmDevice, DmOptions, LinearDev, LinearDevTargetParams, Sectors, TargetLine,
+};
 
 use crate::{
     engine::{
         strat_engine::{
-            cmd::create_fs, dm::get_dm, serde_structs::FilesystemSave,
-            thinpool::filesystem::StratFilesystem,
+            cmd::create_fs,
+            dm::{get_dm, mdv_device},
+            ns::NS_TMPFS_LOCATION,
+            serde_structs::FilesystemSave,
+            thinpool::filesystem::{fs_usage, StratFilesystem},
         },
         types::{FilesystemUuid, Name, PoolUuid, StratisUuid},
     },
-    stratis::StratisResult,
+    stratis::{StratisError, StratisResult},
 };
 
-// TODO: Monitor fs size and extend linear and fs if needed
-// TODO: Document format of stuff on MDV in SWDD (currently ad-hoc)
-
-const RUN_DIR: &str = "/run/stratisd";
 const FILESYSTEM_DIR: &str = "filesystems";
 
 #[derive(Debug)]
@@ -38,72 +45,47 @@ pub struct MetadataVol {
     mount_pt: PathBuf,
 }
 
-/// A helper struct that borrows the MetadataVol and ensures that the MDV is
-/// mounted as long as it is borrowed, and then unmounted.
-#[derive(Debug)]
-struct MountedMDV<'a> {
-    mdv: &'a MetadataVol,
-}
-
-impl<'a> MountedMDV<'a> {
-    /// Borrow the MDV and ensure it's mounted.
-    fn mount(mdv: &MetadataVol) -> StratisResult<MountedMDV<'_>> {
-        if let Err(err) = create_dir_all(&mdv.mount_pt) {
-            if err.kind() != ErrorKind::AlreadyExists {
-                return Err(From::from(err));
-            }
-        }
-
-        match mount(
-            Some(&mdv.dev.devnode()),
-            &mdv.mount_pt,
-            Some("xfs"),
-            MsFlags::empty(),
-            None as Option<&str>,
-        ) {
-            Err(nix::Error::EBUSY) => {
-                // The device is already mounted at the specified mount point
-                Ok(())
-            }
-            Err(err) => Err(err),
-            Ok(_) => Ok(()),
-        }?;
-
-        Ok(MountedMDV { mdv })
-    }
-
-    fn mount_pt(&self) -> &Path {
-        &self.mdv.mount_pt
-    }
-}
-
-impl<'a> Drop for MountedMDV<'a> {
-    fn drop(&mut self) {
-        if let Err(err) = umount(&self.mdv.mount_pt) {
-            warn!("Could not unmount MDV: {}", err);
-        } else if let Err(err) = remove_dir(&self.mdv.mount_pt) {
-            warn!("Could not remove MDV mount point: {}", err);
-        }
-    }
-}
-
 impl MetadataVol {
+    /// Minimum allocation size for a file is a block which will be 4k in this
+    /// set up.
+    const XFS_MIN_FILE_ALLOC_SIZE: Sectors = Sectors(8);
+
     /// Initialize a new Metadata Volume.
     pub fn initialize(pool_uuid: PoolUuid, dev: LinearDev) -> StratisResult<MetadataVol> {
-        create_fs(&dev.devnode(), Some(StratisUuid::Pool(pool_uuid)), true)?;
+        create_fs(&dev.devnode(), Some(StratisUuid::Pool(pool_uuid)))?;
         MetadataVol::setup(pool_uuid, dev)
     }
 
     /// Set up an existing Metadata Volume.
     pub fn setup(pool_uuid: PoolUuid, dev: LinearDev) -> StratisResult<MetadataVol> {
         let filename = format!(".mdv-{}", uuid_to_string!(pool_uuid));
-        let mount_pt: PathBuf = vec![RUN_DIR, &filename].iter().collect();
+        let mount_pt: PathBuf = [NS_TMPFS_LOCATION, &filename].iter().collect();
 
         let mdv = MetadataVol { dev, mount_pt };
 
         {
-            let mount = MountedMDV::mount(&mdv)?;
-            let filesystem_path = mount.mount_pt().join(FILESYSTEM_DIR);
+            if let Err(err) = create_dir_all(&mdv.mount_pt) {
+                if err.kind() != ErrorKind::AlreadyExists {
+                    return Err(From::from(err));
+                }
+            }
+
+            match mount(
+                Some(&mdv.dev.devnode()),
+                &mdv.mount_pt,
+                Some("xfs"),
+                MsFlags::empty(),
+                None as Option<&str>,
+            ) {
+                Err(nix::Error::EBUSY) => {
+                    // The device is already mounted at the specified mount point
+                    Ok(())
+                }
+                Err(err) => Err(err),
+                Ok(_) => Ok(()),
+            }?;
+
+            let filesystem_path = mdv.mount_pt.join(FILESYSTEM_DIR);
 
             if let Err(err) = create_dir(&filesystem_path) {
                 if err.kind() != ErrorKind::AlreadyExists {
@@ -128,7 +110,7 @@ impl MetadataVol {
         uuid: FilesystemUuid,
         fs: &StratFilesystem,
     ) -> StratisResult<()> {
-        let data = serde_json::to_string(&fs.record(name, uuid))?;
+        let data = serde_json::to_vec(&fs.record(name, uuid))?;
         let path = self
             .mount_pt
             .join(FILESYSTEM_DIR)
@@ -137,21 +119,26 @@ impl MetadataVol {
 
         let temp_path = path.with_extension("temp");
 
-        let _mount = MountedMDV::mount(self)?;
-
-        // Braces to ensure f is closed before renaming
         {
-            let mut f = OpenOptions::new()
+            let mut mdv_record_file = OpenOptions::new()
                 .write(true)
                 .create(true)
+                .truncate(true)
                 .open(&temp_path)?;
-            f.write_all(data.as_bytes())?;
 
-            // Try really hard to make sure it goes to disk
-            f.sync_all()?;
+            mdv_record_file.write_all(&data)?;
+            // This ultimately results in an fsync() on the file.
+            mdv_record_file.sync_all()?;
         }
 
         rename(temp_path, path)?;
+
+        // fsync() on directory needs to occur after the rename because the rename
+        // is atomic but not durable until the fsync on the directory metadata is
+        // forced to disk.
+        //
+        // Failing to do so can result in a zero-sized file if a crash occurs.
+        File::open(self.mount_pt.join(FILESYSTEM_DIR))?.sync_all()?;
 
         Ok(())
     }
@@ -164,12 +151,19 @@ impl MetadataVol {
             .join(uuid_to_string!(fs_uuid))
             .with_extension("json");
 
-        let _mount = MountedMDV::mount(self)?;
-
-        if let Err(err) = remove_file(fs_path) {
-            if err.kind() != ErrorKind::NotFound {
+        let needs_fsync = if let Err(err) = remove_file(fs_path) {
+            if err.kind() == ErrorKind::NotFound {
+                false
+            } else {
                 return Err(From::from(err));
             }
+        } else {
+            true
+        };
+
+        if needs_fsync {
+            // Make file unlink durable.
+            File::open(self.mount_pt.join(FILESYSTEM_DIR))?.sync_all()?;
         }
 
         Ok(())
@@ -179,16 +173,14 @@ impl MetadataVol {
     pub fn filesystems(&self) -> StratisResult<Vec<FilesystemSave>> {
         let mut filesystems = Vec::new();
 
-        let mount = MountedMDV::mount(self)?;
-
-        for dir_e in read_dir(mount.mount_pt().join(FILESYSTEM_DIR))? {
+        for dir_e in read_dir(self.mount_pt.join(FILESYSTEM_DIR))? {
             let dir_e = dir_e?;
 
             if dir_e.path().ends_with(".temp") {
                 continue;
             }
 
-            let mut f = OpenOptions::new().read(true).open(&dir_e.path())?;
+            let mut f = OpenOptions::new().read(true).open(dir_e.path())?;
             let mut data = Vec::new();
             f.read_to_end(&mut data)?;
 
@@ -199,8 +191,42 @@ impl MetadataVol {
     }
 
     /// Tear down a Metadata Volume.
-    pub fn teardown(&mut self) -> StratisResult<()> {
-        self.dev.teardown(get_dm())?;
+    pub fn teardown(&mut self, pool_uuid: PoolUuid) -> StratisResult<()> {
+        let mtpt_stat = match stat(&self.mount_pt) {
+            Ok(s) => s,
+            Err(e) => match e {
+                nix::errno::Errno::ENOENT => return Ok(()),
+                e => return Err(StratisError::Nix(e)),
+            },
+        };
+        let parent_stat = match stat(&self.mount_pt.join("..")) {
+            Ok(s) => s,
+            Err(e) => match e {
+                nix::errno::Errno::ENOENT => return Ok(()),
+                e => return Err(StratisError::Nix(e)),
+            },
+        };
+
+        if mtpt_stat.st_dev != parent_stat.st_dev {
+            if let Err(retry::Error { error, .. }) =
+                retry_with_index(Fixed::from_millis(100).take(2), |i| {
+                    trace!("MDV unmount attempt {i}");
+                    umount(&self.mount_pt)
+                })
+            {
+                return Err(StratisError::Chained(
+                    "Failed to unmount MDV".to_string(),
+                    Box::new(StratisError::from(error)),
+                ));
+            }
+        }
+
+        if let Err(err) = remove_dir(&self.mount_pt) {
+            warn!("Could not remove MDV mount point: {err}");
+        }
+
+        let dev = mdv_device(pool_uuid);
+        get_dm().device_remove(&DevId::Name(&dev), DmOptions::default())?;
 
         Ok(())
     }
@@ -229,6 +255,55 @@ impl MetadataVol {
     ) -> StratisResult<()> {
         self.dev.set_table(get_dm(), table)?;
         Ok(())
+    }
+
+    /// The maximum number of filesystems that can be recorded in the MDV.
+    pub fn max_fs_limit(&self) -> StratisResult<u64> {
+        let (total_size, _) = fs_usage(&self.mount_pt)?;
+        Ok(total_size.sectors() / Self::XFS_MIN_FILE_ALLOC_SIZE)
+    }
+}
+
+impl Drop for MetadataVol {
+    fn drop(&mut self) {
+        fn drop_failure(mount_pt: &PathBuf) -> StratisResult<()> {
+            let mtpt_stat = match stat(mount_pt) {
+                Ok(s) => s,
+                Err(e) => match e {
+                    nix::errno::Errno::ENOENT => return Ok(()),
+                    e => return Err(StratisError::Nix(e)),
+                },
+            };
+            let parent_stat = match stat(&mount_pt.join("..")) {
+                Ok(s) => s,
+                Err(e) => match e {
+                    nix::errno::Errno::ENOENT => return Ok(()),
+                    e => return Err(StratisError::Nix(e)),
+                },
+            };
+
+            if mtpt_stat.st_dev != parent_stat.st_dev {
+                if let Err(retry::Error { error, .. }) =
+                    retry_with_index(Fixed::from_millis(100).take(2), |i| {
+                        trace!("MDV unmount attempt {i}");
+                        umount(mount_pt)
+                    })
+                {
+                    Err(StratisError::Chained(
+                        "Failed to unmount MDV".to_string(),
+                        Box::new(StratisError::from(error)),
+                    ))
+                } else {
+                    Ok(())
+                }
+            } else {
+                Ok(())
+            }
+        }
+
+        if let Err(e) = drop_failure(&self.mount_pt) {
+            warn!("Failed to unmount MDV; some cleanup may not be able to be done: {e}");
+        }
     }
 }
 

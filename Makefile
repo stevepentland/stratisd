@@ -1,19 +1,55 @@
-ifeq ($(origin TARGET), undefined)
-else
-  TARGET_ARGS = --target=${TARGET}
-endif
-
-ifeq ($(origin MANIFEST_PATH), undefined)
-else
-  MANIFEST_PATH_ARGS = --manifest-path=${MANIFEST_PATH}
-endif
-
 ifeq ($(origin FEDORA_RELEASE), undefined)
 else
   FEDORA_RELEASE_ARGS = --release=${FEDORA_RELEASE}
 endif
 
 IGNORE_ARGS ?=
+
+ifeq ($(origin PROFILE), undefined)
+else
+  PROFILE_FLAGS = -C instrument-coverage
+endif
+
+ifeq ($(origin CAP_LINTS), undefined)
+else
+  CAP_LINTS_FLAGS = --cap-lints=${CAP_LINTS}
+endif
+
+RUSTFLAGS = ${PROFILE_FLAGS} ${CAP_LINTS_FLAGS}
+
+ifneq ($(origin AUDITABLE), undefined)
+  BUILD = auditable build
+  CLIPPY = clippy
+  RUSTC = auditable rustc
+  TEST = test
+else ifneq ($(origin MINIMAL), undefined)
+  BUILD = minimal-versions build --direct
+  CLIPPY = minimal-versions clippy --direct
+  RUSTC = rustc
+  TEST = minimal-versions test --direct
+else
+  BUILD = build
+  CLIPPY = clippy
+  RUSTC = rustc
+  TEST = test
+endif
+
+ifeq ($(origin CLIPPY_FIX), undefined)
+  CLIPPY_OPTS = --all-targets --no-deps
+else
+  CLIPPY_OPTS = --fix --allow-dirty --allow-staged
+endif
+
+ifeq ($(origin TARGET), undefined)
+else
+  TARGET_ARGS = --target=${TARGET}
+endif
+
+.DEFAULT_GOAL := help
+
+COMPARE_FEDORA_VERSIONS ?=
+
+INSTALL ?= /usr/bin/install
 
 DESTDIR ?=
 PREFIX ?= /usr
@@ -31,359 +67,542 @@ BINDIR ?= $(PREFIX)/bin
 PROFILEDIR ?= release
 
 ifeq ($(PROFILEDIR), debug)
-  PROFILETARGET = build
-  PROFILEMINTARGET = build-min
+  RELEASE_FLAG =
+  STATIC_CARGO_FLAGS = CARGO_PROFILE_DEV_LTO=thin
 else
-  PROFILETARGET = release
-  PROFILEMINTARGET = release-min
+  RELEASE_FLAG = --release
+  STATIC_CARGO_FLAGS = CARGO_PROFILE_RELEASE_LTO=thin
 endif
 
-MIN_FEATURES = --no-default-features --features min
-SYSTEMD_FEATURES = --no-default-features --features min,systemd_compat
-EXTRAS_FEATURES =  --features extras
+MIN_FEATURES = --no-default-features --features engine,min
+NO_IPC_FEATURES = --no-default-features --features engine
+SYSTEMD_FEATURES = --no-default-features --features engine,min,systemd_compat
+EXTRAS_FEATURES =  --no-default-features --features engine,extras
+UDEV_FEATURES = --no-default-features --features udev_scripts
+UTILS_FEATURES = --no-default-features --features dbus_enabled,engine,systemd_compat
 
-DENY = -D warnings -D future-incompatible -D unused -D rust_2018_idioms -D rust_2018_compatibility -D nonstandard_style
+STATIC_CFLAGS = -C target-feature=+crt-static
 
-CLIPPY_DENY = -D clippy::all -D clippy::cargo
+.PHONY: actionlint
+## Lint Github Workflows files
+actionlint:
+	actionlint
 
-# Explicitly allow these lints because they don't seem helpful
-# doc_markdown: we would rather have useful than well-formatted docs
-# from_over_into: preferring from over into is very awkward with JSON report
-# manual_filter_map: sometimes map() after filter_map() is clearer
-# map_err_ignore: we generally drop the errors for a reason
-# option_if_let_else: causing problems with if-else chains
-# similar_names: judges "yes" and "res" to be too similar
-# upper_case_acronyms: We use upper case for initialisms, e.g., BDA
-CLIPPY_PEDANTIC_USELESS = -A clippy::doc_markdown \
-                          -A clippy::from_over_into \
-                          -A clippy::manual_filter_map \
-                          -A clippy::map_err_ignore \
-                          -A clippy::option_if_let_else \
-                          -A clippy::similar_names \
-                          -A clippy::upper_case_acronyms \
+.PHONY: audit
+## Run cargo audit
+audit:
+	cargo audit
 
-# Clippy allow/deny adjudications for pedantic lints
-#
-# Allows represent lints we fail but which we may
-# conclude are helpful at some time.
-CLIPPY_PEDANTIC = -D clippy::await_holding_lock \
-                  -D clippy::await_holding_refcell_ref \
-                  -D clippy::cast_lossless \
-                  -D clippy::cast_possible_truncation \
-                  -A clippy::cast_possible_wrap \
-                  -D clippy::cast_precision_loss \
-                  -D clippy::cast_ptr_alignment \
-                  -A clippy::cast_sign_loss \
-                  -D clippy::checked_conversions \
-                  -D clippy::copy_iterator \
-                  -A clippy::default_trait_access \
-                  -D clippy::empty_enum \
-                  -D clippy::enum_glob_use \
-                  -D clippy::expl_impl_clone_on_copy \
-                  -D clippy::explicit_deref_methods \
-                  -D clippy::explicit_into_iter_loop \
-                  -A clippy::explicit_iter_loop \
-                  -A clippy::filter_map_next \
-                  -D clippy::fn_params_excessive_bools \
-                  -A clippy::if_not_else \
-                  -D clippy::implicit_hasher \
-                  -D clippy::implicit_saturating_sub \
-                  -D clippy::inefficient_to_string \
-                  -D clippy::inline_always \
-                  -D clippy::invalid_upcast_comparisons \
-                  -A clippy::items_after_statements \
-                  -D clippy::large_digit_groups \
-                  -D clippy::large_stack_arrays \
-                  -D clippy::large_types_passed_by_value \
-                  -D clippy::let_unit_value \
-                  -D clippy::linkedlist \
-                  -D clippy::macro_use_imports \
-                  -D clippy::manual_ok_or \
-                  -D clippy::map_flatten \
-                  -A clippy::map_unwrap_or \
-                  -D clippy::match_bool \
-                  -D clippy::match_on_vec_items \
-                  -A clippy::match_same_arms \
-                  -D clippy::match_wild_err_arm \
-                  -A clippy::match_wildcard_for_single_variants \
-                  -D clippy::maybe_infinite_iter \
-                  -A clippy::missing_errors_doc \
-                  -A clippy::module_name_repetitions \
-                  -A clippy::must_use_candidate \
-                  -D clippy::mut_mut \
-                  -D clippy::needless_continue \
-                  -A clippy::needless_pass_by_value \
-                  -A clippy::non_ascii_literal \
-                  -A clippy::option_if_let_else \
-                  -D clippy::option_option \
-                  -D clippy::range_minus_one \
-                  -D clippy::range_plus_one \
-                  -A clippy::redundant_closure_for_method_calls \
-                  -D clippy::ref_option_ref \
-                  -D clippy::same_functions_in_if_condition \
-                  -A clippy::shadow_unrelated \
-                  -A clippy::single_match_else \
-                  -D clippy::string_add_assign \
-                  -D clippy::struct_excessive_bools \
-                  -A clippy::too_many_lines \
-                  -D clippy::trait_duplication_in_bounds \
-                  -D clippy::trivially_copy_pass_by_ref \
-                  -D clippy::type_repetition_in_bounds \
-                  -D clippy::unicode_not_nfc \
-                  -D clippy::unnested_or_patterns \
-                  -D clippy::unreadable_literal \
-                  -D clippy::unsafe_derive_deserialize \
-                  -A clippy::unseparated_literal_suffix \
-                  -D clippy::unused_self \
-                  -D clippy::used_underscore_binding \
-                  -D clippy::used_underscore_binding \
-                  -D clippy::verbose_bit_mask \
-                  -D clippy::wildcard_imports
+.PHONY: audit-all-rust
+## Audit Rust executables
+audit-all-rust: build-all-rust
+	cargo audit bin \
+		./target/${PROFILEDIR}/stratisd \
+		./target/${PROFILEDIR}/stratisd-min \
+		./target/${PROFILEDIR}/stratis-min \
+		./target/${PROFILEDIR}/stratis-utils \
+	        ./target/${PROFILEDIR}/stratis-str-cmp \
+	        ./target/${PROFILEDIR}/stratis-base32-decode \
+	        ./target/${PROFILEDIR}/stratisd-tools
 
-${HOME}/.cargo/bin/cargo-outdated:
-	cargo install cargo-outdated
+.PHONY: build-all
+## Build all stratisd binaries and configuration necessary for install
+build-all: build-all-rust build-all-man
 
-${HOME}/.cargo/bin/cargo-license:
-	cargo install cargo-license
+.PHONY: build-all-man
+## Build all man pages
+build-all-man: docs/stratisd.8 docs/stratis-dumpmetadata.8
 
-${HOME}/.cargo/bin/cargo-bloat:
-	cargo install cargo-bloat
+.PHONY: build-all-rust
+## Build all Rust artifacts
+build-all-rust: stratisd build-min build-utils build-udev-utils stratisd-tools
 
-${HOME}/.cargo/bin/cargo-audit:
-	cargo install cargo-audit
-
-${HOME}/.cargo/bin/cargo-expand:
-	cargo install cargo-expand
-
-outdated: ${HOME}/.cargo/bin/cargo-outdated
-	PATH=${HOME}/.cargo/bin:${PATH} cargo outdated
-
-license: ${HOME}/.cargo/bin/cargo-license
-	PATH=${HOME}/.cargo/bin:${PATH} cargo license
-
-bloat: ${HOME}/.cargo/bin/cargo-bloat
-	PATH=${HOME}/.cargo/bin:${PATH} cargo bloat --release
-	PATH=${HOME}/.cargo/bin:${PATH} cargo bloat --release --crates
-
-audit: ${HOME}/.cargo/bin/cargo-audit
-	PATH=${HOME}/.cargo/bin:${PATH} cargo audit -D warnings
-
-expand: ${HOME}/.cargo/bin/cargo-expand
-	PATH=${HOME}/.cargo/bin:${PATH} cargo expand --lib=libstratisd engine::strat_engine::pool
-
-fmt: fmt-macros
-	cargo fmt
-
-fmt-macros:
-	cd stratisd_proc_macros && cargo fmt
-
-fmt-travis: fmt-macros-travis
-	cargo fmt -- --check
-
-fmt-macros-travis:
-	cd stratisd_proc_macros && cargo fmt -- --check
-
-fmt-shell:
-	shfmt -l -w .
-
-fmt-shell-ci:
-	shfmt -d .
-
-build:
-	PKG_CONFIG_ALLOW_CROSS=1 \
-	RUSTFLAGS="${DENY}" \
-	cargo build ${TARGET_ARGS}
-
-build-tests:
-	PKG_CONFIG_ALLOW_CROSS=1 \
-	RUSTFLAGS="${DENY}" \
-	cargo test --no-run ${TARGET_ARGS}
-
-build-extras:
-	PKG_CONFIG_ALLOW_CROSS=1 \
-	RUSTFLAGS="${DENY}" \
-	cargo build ${EXTRAS_FEATURES} ${TARGET_ARGS}
-
+.PHONY: build-min
+## Build stratisd-min and stratis-min for early userspace
 build-min:
 	PKG_CONFIG_ALLOW_CROSS=1 \
-	RUSTFLAGS="${DENY}" \
-	cargo build --bin=stratis-min --bin=stratisd-min --bin=stratis-utils \
+	RUSTFLAGS="${RUSTFLAGS}" \
+	cargo ${BUILD} ${RELEASE_FLAG} \
+	--bin=stratis-min --bin=stratisd-min \
 	${SYSTEMD_FEATURES} ${TARGET_ARGS}
 
-release-min:
+.PHONY: build-min-no-systemd
+## Build min targets without systemd support enabled
+build-min-no-systemd:
 	PKG_CONFIG_ALLOW_CROSS=1 \
-	RUSTFLAGS="${DENY}" \
-	cargo build --release --bin=stratis-min --bin=stratisd-min \
-	--bin=stratis-utils ${SYSTEMD_FEATURES} ${TARGET_ARGS}
+	cargo ${BUILD} ${RELEASE_FLAG} \
+	--bin=stratis-min --bin=stratisd-min \
+	${MIN_FEATURES} ${TARGET_ARGS}
 
-stratis-dumpmetadata:
+.PHONY: build-no-ipc
+## Build stratisd-min and stratis-min for early userspace
+build-no-ipc:
 	PKG_CONFIG_ALLOW_CROSS=1 \
-	RUSTFLAGS="${DENY}" \
-	cargo build --bin=stratis_dumpmetadata ${EXTRAS_FEATURES} ${TARGET_ARGS}
+	RUSTFLAGS="${RUSTFLAGS}" \
+	cargo ${BUILD} ${RELEASE_FLAG} \
+	--bin=stratisd \
+	${NO_IPC_FEATURES} \
+	${TARGET_ARGS}
 
-stratis-min:
+
+.PHONY: build-tests
+## Build the stratisd test suite
+build-tests:
 	PKG_CONFIG_ALLOW_CROSS=1 \
-	RUSTFLAGS="${DENY}" \
-	cargo build --bin=stratis-min ${MIN_FEATURES} ${TARGET_ARGS}
+	RUSTFLAGS="${RUSTFLAGS}" \
+	cargo ${TEST} --no-run ${RELEASE_FLAG} ${TARGET_ARGS}
 
-stratisd-min:
+.PHONY: build-udev-utils
+## Build stratis-base32-decode and stratis-str-cmp statically
+build-udev-utils: stratis-str-cmp stratis-base32-decode
+
+.PHONY: build-utils
+## Build stratis-utils only
+build-utils:
 	PKG_CONFIG_ALLOW_CROSS=1 \
-	RUSTFLAGS="${DENY}" \
-	cargo build --bin=stratisd-min ${SYSTEMD_FEATURES} ${TARGET_ARGS}
+	RUSTFLAGS="${RUSTFLAGS}" \
+	cargo ${BUILD} ${RELEASE_FLAG} \
+	--bin=stratis-utils \
+	${UTILS_FEATURES} ${TARGET_ARGS}
 
-install-cfg: docs/stratisd.8
-	install -Dpm0644 -t $(DESTDIR)$(DATADIR)/dbus-1/system.d stratisd.conf
-	install -Dpm0644 -t $(DESTDIR)$(MANDIR)/man8 docs/stratisd.8
-	install -Dpm0644 -t $(DESTDIR)$(UDEVDIR)/rules.d udev/61-stratisd.rules
-	install -Dpm0644 -t $(DESTDIR)$(UNITDIR) systemd/stratisd.service
-	install -Dpm0755 -d $(DESTDIR)$(DRACUTDIR)/modules.d/90stratis
-	install -Dpm0755 -t $(DESTDIR)$(DRACUTDIR)/modules.d/90stratis dracut/90stratis/module-setup.sh
-	install -Dpm0755 -t $(DESTDIR)$(DRACUTDIR)/modules.d/90stratis dracut/90stratis/stratis-rootfs-setup
-	install -Dpm0644 -t $(DESTDIR)$(DRACUTDIR)/modules.d/90stratis dracut/90stratis/stratisd-min.service
-	install -Dpm0644 -t $(DESTDIR)$(DRACUTDIR)/modules.d/90stratis dracut/90stratis/61-stratisd.rules
-	install -Dpm0755 -d $(DESTDIR)$(DRACUTDIR)/modules.d/90stratis-clevis
-	install -Dpm0755 -t $(DESTDIR)$(DRACUTDIR)/modules.d/90stratis-clevis dracut/90stratis-clevis/module-setup.sh
-	install -Dpm0755 -t $(DESTDIR)$(DRACUTDIR)/modules.d/90stratis-clevis dracut/90stratis-clevis/stratis-clevis-rootfs-setup
-	install -Dpm0644 -t $(DESTDIR)$(UNITDIR) systemd/stratisd-min-postinitrd.service
-	install -Dpm0644 -t $(DESTDIR)$(UNITDIR) systemd/stratis-fstab-setup@.service
+.PHONY: build-utils-no-systemd
+## Build stratis-utils without systemd
+build-utils-no-systemd:
+	PKG_CONFIG_ALLOW_CROSS=1 \
+	cargo ${BUILD} ${RELEASE_FLAG} \
+	--bin=stratis-utils \
+	${NO_IPC_FEATURES} ${TARGET_ARGS}
 
-install: $(PROFILETARGET) $(PROFILEMINTARGET) install-cfg
-	install -Dpm0755 -t $(DESTDIR)$(LIBEXECDIR) target/$(PROFILEDIR)/stratisd
-	install -Dpm0755 -t $(DESTDIR)$(UDEVDIR) target/$(PROFILEDIR)/stratis-utils
-	mv -fv $(DESTDIR)$(UDEVDIR)/stratis-utils $(DESTDIR)$(UDEVDIR)/stratis-str-cmp
-	ln -fv $(DESTDIR)$(UDEVDIR)/stratis-str-cmp $(DESTDIR)$(UDEVDIR)/stratis-base32-decode
-	ln -fv $(DESTDIR)$(UDEVDIR)/stratis-str-cmp $(DESTDIR)$(BINDIR)/stratis-predict-usage
-	ln -fv $(DESTDIR)$(UDEVDIR)/stratis-str-cmp $(DESTDIR)$(UNITGENDIR)/stratis-clevis-setup-generator
-	ln -fv $(DESTDIR)$(UDEVDIR)/stratis-str-cmp $(DESTDIR)$(UNITGENDIR)/stratis-setup-generator
-	install -Dpm0755 -t $(DESTDIR)$(PREFIX)/bin target/$(PROFILEDIR)/stratis-min
-	install -Dpm0755 -t $(DESTDIR)$(LIBEXECDIR) target/$(PROFILEDIR)/stratisd-min
-	install -Dpm0755 -t $(DESTDIR)$(UNITEXECDIR) systemd/stratis-fstab-setup
+.PHONY: check-fedora-versions
+## Verify that the dependency specs are satisfied in Fedora
+check-fedora-versions: test-compare-fedora-versions
+	${COMPARE_FEDORA_VERSIONS} ${FEDORA_RELEASE_ARGS} ${IGNORE_ARGS}
 
-# remove installed configuration files
-clean-cfg:
-	rm -fv $(DESTDIR)$(DATADIR)/dbus-1/system.d/stratisd.conf
-	rm -fv $(DESTDIR)$(MANDIR)/man8/stratisd.8
-	rm -fv $(DESTDIR)$(UDEVDIR)/rules.d/*-stratisd.rules
-	rm -fv $(DESTDIR)$(UNITDIR)/stratisd.service
-	rm -rfv $(DESTDIR)$(DRACUTDIR)/modules.d/90stratis
-	rm -rfv $(DESTDIR)$(DRACUTDIR)/modules.d/90stratis-clevis
-	rm -fv $(DESTDIR)$(UNITDIR)/stratisd-min-postinitrd.service
-	rm -fv $(DESTDIR)$(UNITDIR)/stratis-fstab-setup@.service
+.PHONY: check-typos
+## Check for spelling errors
+check-typos:
+	typos
 
-# remove installed non-primary tools generated by the build process
+.PHONY: clean
+## Remove installed items
+clean: clean-cfg clean-ancillary clean-primary
+
+.PHONY: clean-ancillary
+## Remove installed non-primary tools generated by the build process
 clean-ancillary:
 	rm -fv $(DESTDIR)$(UDEVDIR)/stratis-str-cmp
 	rm -fv $(DESTDIR)$(UDEVDIR)/stratis-base32-decode
 	rm -fv $(DESTDIR)$(BINDIR)/stratis-predict-usage
+	rm -fv $(DESTDIR)$(BINDIR)/stratisd-tools
+	rm -fv $(DESTDIR)$(BINDIR)/stratis-dumpmetadata
+	rm -fv $(DESTDIR)$(BINDIR)/stratis-decode-dm
 	rm -fv $(DESTDIR)$(UNITGENDIR)/stratis-setup-generator
 	rm -fv $(DESTDIR)$(UNITGENDIR)/stratis-clevis-setup-generator
 	rm -fv $(DESTDIR)$(UNITEXECDIR)/stratis-fstab-setup
 
-# remove installed command-line tools and daemons generated by the build process
+.PHONY: clean-cfg
+## Remove installed configuration files
+clean-cfg:
+	rm -fv $(DESTDIR)$(DATADIR)/dbus-1/system.d/stratisd.conf
+	rm -fv $(DESTDIR)$(MANDIR)/man8/stratisd.8
+	rm -fv $(DESTDIR)$(MANDIR)/man8/stratis-dumpmetadata.8
+	rm -fv $(DESTDIR)$(UDEVDIR)/rules.d/*-stratisd.rules
+	rm -fv $(DESTDIR)$(UNITDIR)/stratisd.service
+	rm -rfv $(DESTDIR)$(DRACUTDIR)/modules.d/50stratis
+	rm -rfv $(DESTDIR)$(DRACUTDIR)/modules.d/50stratis-clevis
+	rm -fv $(DESTDIR)$(UNITDIR)/stratisd-min-postinitrd.service
+	rm -fv $(DESTDIR)$(UNITDIR)/stratis-fstab-setup@.service
+	rm -fv $(DESTDIR)$(UNITDIR)/stratis-fstab-setup-with-network@.service
+
+.PHONY: clean-primary
+## Remove installed command-line tools and daemons generated by the build process
 clean-primary:
 	rm -fv $(DESTDIR)$(LIBEXECDIR)/stratisd
-	rm -fv $(DESTDIR)$(PREFIX)/stratis-min
+	rm -fv $(DESTDIR)$(BINDIR)/stratis-min
 	rm -fv $(DESTDIR)$(LIBEXECDIR)/stratisd-min
 
-# remove installed items
-clean: clean-cfg clean-ancillary clean-primary
+.PHONY: clippy
+## Run clippy on the current source tree
+clippy: clippy-macros clippy-min clippy-udev-utils clippy-no-ipc clippy-utils
+	cargo ${CLIPPY} ${CLIPPY_OPTS}
 
-release:
-	RUSTFLAGS="${DENY}" cargo build --release
+.PHONY: clippy-macros
+## Run clippy on stratisd_proc_macros
+clippy-macros:
+	cd stratisd_proc_macros && cargo ${CLIPPY} --all-features ${CLIPPY_OPTS}
 
-test-loop:
-	RUSTFLAGS="${DENY}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 cargo test loop_ -- --skip clevis_loop_
+.PHONY: clippy-min
+## Run clippy on the -min build
+clippy-min:
+	cargo ${CLIPPY} ${CLIPPY_OPTS} ${MIN_FEATURES}
+	cargo ${CLIPPY} ${CLIPPY_OPTS} ${SYSTEMD_FEATURES}
+	cargo ${CLIPPY} ${CLIPPY_OPTS} ${EXTRAS_FEATURES}
 
-test-real:
-	RUSTFLAGS="${DENY}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 cargo test real_ -- --skip clevis_real_
+.PHONY: clippy-no-ipc
+## Run clippy on no-ipc-build
+clippy-no-ipc:
+	cargo ${CLIPPY} ${CLIPPY_OPTS} ${NO_IPC_FEATURES}
 
-test:
-	RUSTFLAGS="${DENY}" RUST_BACKTRACE=1 cargo test --all-features -- --skip real_ --skip loop_ --skip clevis_
+.PHONY: clippy-udev-utils
+## Run clippy on the udev utils
+clippy-udev-utils:
+	cargo ${CLIPPY} ${CLIPPY_OPTS} ${UDEV_FEATURES}
 
-test-clevis-real:
-	RUSTFLAGS="${DENY}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 cargo test clevis_real_
+.PHONY: clippy-utils
+## Run clippy on the utils binary
+clippy-utils:
+	cargo ${CLIPPY} ${CLIPPY_OPTS} ${UTILS_FEATURES}
 
-test-clevis-loop:
-	RUSTFLAGS="${DENY}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 cargo test clevis_loop_
+.PHONY: docs-ci
+## Build docs-rust for CI
+docs-ci: docs-rust
 
-yamllint:
-	yamllint --strict .github/workflows/*.yml
-
-docs-travis: docs-rust
-
+.PHONY: docs-rust
+## Build rust documentation
 docs-rust:
 	cargo doc --no-deps
 
-docs/stratisd.8: docs/stratisd.txt
-	a2x -f manpage docs/stratisd.txt
+docs/%.8: docs/%.txt
+	a2x -f manpage $<
 
-clippy-macros:
-	cd stratisd_proc_macros && RUSTFLAGS="${DENY}" cargo clippy --all-targets --all-features -- ${CLIPPY_DENY} ${CLIPPY_PEDANTIC} ${CLIPPY_PEDANTIC_USELESS}
+.PHONY: fix-typos
+## Fix spelling errors
+fix-typos:
+	typos -w
 
-# stratisd requires the most recent version of libmount, which is over 2 years
-# old and requires some older versions of nix and cfg-if which are not
-# semantic version compatible with the new ones that stratisd requires
-STRATISD_CLIPPY_DENY = ${CLIPPY_DENY} -A clippy::multiple-crate-versions
-clippy: clippy-macros
-	RUSTFLAGS="${DENY}" cargo clippy --all-targets -- ${STRATISD_CLIPPY_DENY} ${CLIPPY_PEDANTIC} ${CLIPPY_PEDANTIC_USELESS}
-	RUSTFLAGS="${DENY}" cargo clippy --all-targets ${MIN_FEATURES} -- ${STRATISD_CLIPPY_DENY} ${CLIPPY_PEDANTIC} ${CLIPPY_PEDANTIC_USELESS}
-	RUSTFLAGS="${DENY}" cargo clippy --all-targets ${SYSTEMD_FEATURES} -- ${STRATISD_CLIPPY_DENY} ${CLIPPY_PEDANTIC} ${CLIPPY_PEDANTIC_USELESS}
+.PHONY: fmt
+## Run cargo fmt
+fmt: fmt-macros
+	cargo fmt
 
-SET_LOWER_BOUNDS ?=
-test-set-lower-bounds:
-	echo "Testing that SET_LOWER_BOUNDS environment variable is set to a valid path"
-	test -e "${SET_LOWER_BOUNDS}"
+.PHONY: fmt-ci
+## Run cargo fmt for CI jobs
+fmt-ci: fmt-macros-ci
+	cargo fmt -- --check
 
-verify-dependency-bounds: test-set-lower-bounds
+.PHONY: fmt-macros
+## Run cargo fmt for stratisd_proc_macros
+fmt-macros:
+	cd stratisd_proc_macros && cargo fmt
+
+.PHONY: fmt-macros-ci
+## Run cargo fmt on stratisd_proc_macros for CI jobs
+fmt-macros-ci:
+	cd stratisd_proc_macros && cargo fmt -- --check
+
+.PHONY: fmt-shell
+## Check shell formatting with shfmt
+fmt-shell:
+	shfmt -l -w .
+
+.PHONY: fmt-shell-ci
+## Check shell formatting with shfmt for CI
+fmt-shell-ci:
+	shfmt -d .
+
+.PHONY: install
+## Install all stratisd files
+install: install-programs install-man-cfg
+
+.PHONY: install-binaries
+## Install binaries
+install-binaries:
+	mkdir -p $(DESTDIR)$(BINDIR)
+	mkdir -p $(DESTDIR)$(UNITGENDIR)
+	$(INSTALL) -Dpm0755 -t $(DESTDIR)$(BINDIR) target/$(PROFILEDIR)/stratis-min
+
+	$(INSTALL) -Dpm0755 -t $(DESTDIR)$(BINDIR) target/$(PROFILEDIR)/stratisd-tools
+	ln --force --verbose $(DESTDIR)$(BINDIR)/stratisd-tools $(DESTDIR)$(BINDIR)/stratis-dumpmetadata
+
+	$(INSTALL) -Dpm0755 -t $(DESTDIR)$(BINDIR) target/$(PROFILEDIR)/stratis-utils
+	mv --force --verbose $(DESTDIR)$(BINDIR)/stratis-utils $(DESTDIR)$(BINDIR)/stratis-predict-usage
+	ln --force --verbose $(DESTDIR)$(BINDIR)/stratis-predict-usage $(DESTDIR)$(UNITGENDIR)/stratis-clevis-setup-generator
+	ln --force --verbose $(DESTDIR)$(BINDIR)/stratis-predict-usage $(DESTDIR)$(UNITGENDIR)/stratis-setup-generator
+	ln --force --verbose $(DESTDIR)$(BINDIR)/stratis-predict-usage $(DESTDIR)$(BINDIR)/stratis-decode-dm
+
+.PHONY: install-daemons
+## Install daemons
+install-daemons:
+	mkdir -p $(DESTDIR)$(LIBEXECDIR)
+	$(INSTALL) -Dpm0755 -t $(DESTDIR)$(LIBEXECDIR) target/$(PROFILEDIR)/stratisd
+	$(INSTALL) -Dpm0755 -t $(DESTDIR)$(LIBEXECDIR) target/$(PROFILEDIR)/stratisd-min
+
+.PHONY: install-dbus-cfg
+## Install dbus config
+install-dbus-cfg:
+	mkdir -p $(DESTDIR)$(DATADIR)/dbus-1/system.d
+	$(INSTALL) -Dpm0644 -t $(DESTDIR)$(DATADIR)/dbus-1/system.d stratisd.conf
+
+.PHONY: install-dracut-cfg
+## Install dracut modules
+install-dracut-cfg:
+	mkdir -p $(DESTDIR)$(DRACUTDIR)/modules.d
+	$(INSTALL) -Dpm0755 -d $(DESTDIR)$(DRACUTDIR)/modules.d/50stratis
+	sed 's|@LIBEXECDIR@|$(LIBEXECDIR)|' dracut/50stratis/stratisd-min.service.in > $(DESTDIR)$(DRACUTDIR)/modules.d/50stratis/stratisd-min.service
+	sed 's|@LIBEXECDIR@|$(LIBEXECDIR)|' dracut/50stratis/module-setup.sh.in > $(DESTDIR)$(DRACUTDIR)/modules.d/50stratis/module-setup.sh
+	$(INSTALL) -Dpm0755 -t $(DESTDIR)$(DRACUTDIR)/modules.d/50stratis dracut/50stratis/stratis-rootfs-setup
+	$(INSTALL) -Dpm0644 -t $(DESTDIR)$(DRACUTDIR)/modules.d/50stratis dracut/50stratis/61-stratisd.rules
+	$(INSTALL) -Dpm0755 -d $(DESTDIR)$(DRACUTDIR)/modules.d/50stratis-clevis
+	$(INSTALL) -Dpm0755 -t $(DESTDIR)$(DRACUTDIR)/modules.d/50stratis-clevis dracut/50stratis-clevis/module-setup.sh
+	$(INSTALL) -Dpm0755 -t $(DESTDIR)$(DRACUTDIR)/modules.d/50stratis-clevis dracut/50stratis-clevis/stratis-clevis-rootfs-setup
+
+.PHONY: install-fstab-script
+## Install fstab script
+install-fstab-script:
+	mkdir -p $(DESTDIR)$(UNITEXECDIR)
+	$(INSTALL) -Dpm0755 -t $(DESTDIR)$(UNITEXECDIR) systemd/stratis-fstab-setup
+
+.PHONY: install-man-cfg
+## Install man pages
+install-man-cfg:
+	mkdir -p $(DESTDIR)$(MANDIR)/man8
+	$(INSTALL) -Dpm0644 -t $(DESTDIR)$(MANDIR)/man8 docs/stratisd.8
+	$(INSTALL) -Dpm0644 -t $(DESTDIR)$(MANDIR)/man8 docs/stratis-dumpmetadata.8
+
+.PHONY: install-programs
+## Install all stratisd programs and config files
+install-programs: install-udev-cfg install-dbus-cfg install-dracut-cfg install-systemd-cfg install-binaries install-udev-binaries install-fstab-script install-daemons
+
+.PHONY: install-systemd-cfg
+## Install systemd configuration
+install-systemd-cfg:
+	mkdir -p $(DESTDIR)$(UNITDIR)
+	sed 's|@LIBEXECDIR@|$(LIBEXECDIR)|' systemd/stratisd.service.in > $(DESTDIR)$(UNITDIR)/stratisd.service
+	sed 's|@LIBEXECDIR@|$(LIBEXECDIR)|' systemd/stratisd-min-postinitrd.service.in > $(DESTDIR)$(UNITDIR)/stratisd-min-postinitrd.service
+	sed 's|@UNITEXECDIR@|$(UNITEXECDIR)|' systemd/stratis-fstab-setup@.service.in > $(DESTDIR)$(UNITDIR)/stratis-fstab-setup@.service
+	sed 's|@UNITEXECDIR@|$(UNITEXECDIR)|' systemd/stratis-fstab-setup-with-network@.service.in > $(DESTDIR)$(UNITDIR)/stratis-fstab-setup-with-network@.service
+
+.PHONY: install-udev-binaries
+## Install udev binaries
+install-udev-binaries:
+	mkdir -p $(DESTDIR)$(UDEVDIR)
+	$(INSTALL) -Dpm0755 -t $(DESTDIR)$(UDEVDIR) target/$(PROFILEDIR)/stratis-base32-decode
+	$(INSTALL) -Dpm0755 -t $(DESTDIR)$(UDEVDIR) target/$(PROFILEDIR)/stratis-str-cmp
+
+.PHONY: install-udev-cfg
+## Install udev configuration
+install-udev-cfg:
+	mkdir -p $(DESTDIR)$(UDEVDIR)/rules.d
+	$(INSTALL) -Dpm0644 -t $(DESTDIR)$(UDEVDIR)/rules.d udev/61-stratisd.rules
+
+.PHONY: stratis-base32-decode
+## Build stratis-base32-decode binary
+stratis-base32-decode:
 	PKG_CONFIG_ALLOW_CROSS=1 \
-	RUSTFLAGS="${DENY}" \
-	cargo build ${MANIFEST_PATH_ARGS} --all-targets --all-features
-	${SET_LOWER_BOUNDS} ${MANIFEST_PATH_ARGS}
-	PKG_CONFIG_ALLOW_CROSS=1 \
-	RUSTFLAGS="${DENY}" \
-	cargo build ${MANIFEST_PATH_ARGS} --all-targets --all-features
+	${STATIC_CARGO_FLAGS} \
+	RUSTFLAGS="${RUSTFLAGS}" \
+	cargo ${RUSTC} ${RELEASE_FLAG}  \
+	--bin=stratis-base32-decode \
+	${UDEV_FEATURES} \
+	${TARGET_ARGS} \
+	-- ${STATIC_CFLAGS}
+	@ldd target/${PROFILEDIR}/stratis-base32-decode|grep --quiet --silent "statically linked" || (echo "stratis-base32-decode is not statically linked" && exit 1)
 
-COMPARE_FEDORA_VERSIONS ?=
+.PHONY: stratis-min
+## Build stratis-min for early userspace
+stratis-min:
+	PKG_CONFIG_ALLOW_CROSS=1 \
+	RUSTFLAGS="${RUSTFLAGS}" \
+	cargo ${BUILD} ${RELEASE_FLAG} \
+	--bin=stratis-min ${MIN_FEATURES} ${TARGET_ARGS}
+
+.PHONY: stratis-str-cmp
+## Build stratis-str-cmp binary
+stratis-str-cmp:
+	PKG_CONFIG_ALLOW_CROSS=1 \
+	${STATIC_CARGO_FLAGS} \
+	RUSTFLAGS="${RUSTFLAGS}" \
+	cargo ${RUSTC} ${RELEASE_FLAG}  \
+	--bin=stratis-str-cmp \
+	${UDEV_FEATURES} \
+	${TARGET_ARGS} \
+	-- ${STATIC_CFLAGS}
+	@ldd target/${PROFILEDIR}/stratis-str-cmp|grep --quiet --silent "statically linked" || (echo "stratis-str-cmp is not statically linked" && exit 1)
+
+.PHONY: stratisd
+## Build stratisd
+stratisd:
+	PKG_CONFIG_ALLOW_CROSS=1 \
+	RUSTFLAGS="${RUSTFLAGS}" \
+	cargo ${BUILD} ${RELEASE_FLAG} \
+	--bin=stratisd \
+	${TARGET_ARGS}
+
+.PHONY: stratisd-min
+## Build stratisd-min for early userspace
+stratisd-min:
+	PKG_CONFIG_ALLOW_CROSS=1 \
+	RUSTFLAGS="${RUSTFLAGS}" \
+	cargo ${BUILD} ${RELEASE_FLAG} \
+	--bin=stratisd-min ${SYSTEMD_FEATURES} ${TARGET_ARGS}
+
+.PHONY: stratisd-tools
+## Build the stratisd-tools program
+stratisd-tools:
+	PKG_CONFIG_ALLOW_CROSS=1 \
+	RUSTFLAGS="${RUSTFLAGS}" \
+	cargo ${BUILD} ${RELEASE_FLAG} \
+	--bin=stratisd-tools ${EXTRAS_FEATURES} ${TARGET_ARGS}
+
+.PHONY: systemd-lint
+## Statically lint systemd configuration files after install step
+systemd-lint:
+	systemd-analyze verify $$(ls /usr/lib/systemd/system/stratis*.service)
+
+.PHONY: test
+## Basic tests
+test:
+	RUSTFLAGS="${RUSTFLAGS}" RUST_BACKTRACE=1 cargo test --all-features -- --skip real_ --skip loop_ --skip clevis_ --skip test_stratis_min_ --skip test_stratisd_min_
+
+.PHONY: test-clevis-loop
+## Clevis tests with loop devices
+test-clevis-loop:
+	RUSTFLAGS="${RUSTFLAGS}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' cargo test clevis_loop_ -- --skip clevis_loop_should_fail_
+
+.PHONY: test-clevis-loop-root
+## Clevis tests with loop devices as root
+test-clevis-loop-root:
+	RUSTFLAGS="${RUSTFLAGS}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 cargo test clevis_loop_ -- --skip clevis_loop_should_fail_
+
+.PHONY: test-clevis-loop-should-fail
+## Clevis loop device tests that are expected to fail
+test-clevis-loop-should-fail:
+	RUSTFLAGS="${RUSTFLAGS}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' cargo test clevis_loop_should_fail_
+
+.PHONY: test-clevis-loop-should-fail-root
+## Clevis loop device tests that are expected to fail as root
+test-clevis-loop-should-fail-root:
+	RUSTFLAGS="${RUSTFLAGS}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 cargo test clevis_loop_should_fail_
+
+.PHONY: test-clevis-loop-should-fail-valgrind
+## Clevis loop device tests that are expected to fail run under valgrind
+test-clevis-loop-should-fail-valgrind:
+	RUST_TEST_THREADS=1 sudo -E valgrind --leak-check=full --num-callers=500 $(shell cargo test --no-run --all-features --message-format=json 2>/dev/null | jq -r 'select(.target.src_path == "'${PWD}/src/lib.rs'") | select(.executable != null) | .executable') clevis_loop_should_fail_
+
+.PHONY: test-clevis-loop-valgrind
+## Clevis tests with loop devices with valgrind
+test-clevis-loop-valgrind:
+	RUST_TEST_THREADS=1 sudo -E valgrind --leak-check=full --num-callers=500 $(shell cargo test --no-run --all-features --message-format=json 2>/dev/null | jq -r 'select(.target.src_path == "'${PWD}/src/lib.rs'") | select(.executable != null) | .executable') clevis_loop_ --skip clevis_loop_should_fail_
+
+.PHONY: test-clevis-real
+## Clevis tests with real devices
+test-clevis-real:
+	RUSTFLAGS="${RUSTFLAGS}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' cargo test clevis_real_ -- --skip clevis_real_should_fail
+
+.PHONY: test-clevis-real-root
+## Clevis tests with real devices as root
+test-clevis-real-root:
+	RUSTFLAGS="${RUSTFLAGS}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 cargo test clevis_real_ -- --skip clevis_real_should_fail
+
+.PHONY: test-clevis-real-should-fail
+## Clevis real device tests that are expected to fail
+test-clevis-real-should-fail:
+	RUSTFLAGS="${RUSTFLAGS}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' cargo test clevis_real_should_fail
+
+.PHONY: test-clevis-real-should-fail-root
+## Clevis real device tests that are expected to fail as root
+test-clevis-real-should-fail-root:
+	RUSTFLAGS="${RUSTFLAGS}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 cargo test clevis_real_should_fail
+
+.PHONY: test-compare-fedora-versions
+## Verify that a script for comparing version specs with Fedora is available
 test-compare-fedora-versions:
 	echo "Testing that COMPARE_FEDORA_VERSIONS environment variable is set to a valid path"
 	test -e "${COMPARE_FEDORA_VERSIONS}"
 
-check-fedora-versions: test-compare-fedora-versions
-	${COMPARE_FEDORA_VERSIONS} ${MANIFEST_PATH_ARGS} ${FEDORA_RELEASE_ARGS} ${IGNORE_ARGS}
+.PHONY: test-loop
+## Tests with loop devices
+test-loop:
+	RUSTFLAGS="${RUSTFLAGS}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' cargo test loop_ -- --skip clevis_loop_
 
-.PHONY:
-	audit
-	bloat
-	build
-	build-min
-	check-fedora-versions
-	clean
-	clean-ancillary
-	clean-cfg
-	clean-primary
-	clippy
-	clippy-macros
-	docs-rust
-	docs-travis
-	expand
-	fmt
-	fmt-shell
-	fmt-shell-ci
-	fmt-travis
-	fmt-macros
-	fmt-macros-travis
-	install
-	install-cfg
-	license
-	outdated
-	release
-	release-min
-	test
-	test-loop
-	test-real
-	test-clevis-loop
-	test-clevis-real
-	test-compare-fedora-versions
-	test-set-lower-bounds
-	verify-dependency-bounds
-	yamllint
+.PHONY: test-loop-root
+## Tests with loop devices as root
+test-loop-root:
+	RUSTFLAGS="${RUSTFLAGS}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 cargo test loop_ -- --skip clevis_loop_
+
+.PHONY: test-loop-valgrind
+## Tests run under valgrind with loop devices
+test-loop-valgrind:
+	RUST_TEST_THREADS=1 sudo -E valgrind --leak-check=full --num-callers=500 $(shell cargo test --no-run --all-features --message-format=json 2>/dev/null | jq -r 'select(.target.src_path == "'${PWD}/src/lib.rs'") | select(.executable != null) | .executable') loop_ --skip real_ --skip clevis_
+
+.PHONY: test-real
+## Tests with real devices
+test-real:
+	RUSTFLAGS="${RUSTFLAGS}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' cargo test real_ -- --skip clevis_real_
+
+.PHONY: test-real-root
+## Tests with real devices as root
+test-real-root:
+	RUSTFLAGS="${RUSTFLAGS}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 cargo test real_ -- --skip clevis_real_
+
+.PHONY: test-stratis-min
+## Test stratis-min CLI
+test-stratis-min:
+	RUSTFLAGS="${RUSTFLAGS}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' cargo test --no-default-features --features "engine,min" test_stratis_min
+
+.PHONY: test-stratis-min-root
+## Test stratis-min CLI as root
+test-stratis-min-root:
+	RUSTFLAGS="${RUSTFLAGS}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 cargo test --no-default-features --features "engine,min" test_stratis_min
+
+.PHONY: test-stratis-utils
+## Test stratis-utils
+test-stratis-utils:
+	RUSTFLAGS="${RUSTFLAGS}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 cargo test --no-default-features --features "dbus_enabled,engine" test_stratis_utils
+
+.PHONY: test-stratisd-min
+## Test stratisd-min CLI
+test-stratisd-min:
+	RUSTFLAGS="${RUSTFLAGS}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' cargo test --no-default-features --features "engine,min" test_stratisd_min
+
+.PHONY: test-stratisd-min-root
+## Test stratisd-min CLI as root
+test-stratisd-min-root:
+	RUSTFLAGS="${RUSTFLAGS}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 cargo test --no-default-features --features "engine,min" test_stratisd_min
+
+.PHONY: test-stratisd-tools
+## Test stratisd-tools CLI
+test-stratisd-tools:
+	RUSTFLAGS="${RUSTFLAGS}" RUST_BACKTRACE=1 RUST_TEST_THREADS=1 cargo test --no-default-features --features "engine,extras" test_stratisd_tools
+
+.PHONY: test-valgrind
+## Basic tests run under valgrind
+test-valgrind:
+	RUST_TEST_THREADS=1 valgrind --leak-check=full --num-callers=500 $(shell cargo test --no-run --all-features --message-format=json 2>/dev/null | jq -r 'select(.target.src_path == "'${PWD}/src/lib.rs'") | select(.executable != null) | .executable') --skip real_ --skip loop_ --skip clevis_
+
+.PHONY: tmtlint
+## Run tmt lint
+tmtlint:
+	tmt lint
+
+.PHONY: yamllint
+## Run yamllint on workflow files
+yamllint:
+	yamllint --strict .github/workflows/*.yml
+	yamllint --strict .packit.yaml
+	yamllint --strict .yamllint.yaml
+
+# COLORS
+GREEN  := $(shell tput -Txterm setaf 2)
+YELLOW := $(shell tput -Txterm setaf 3)
+WHITE  := $(shell tput -Txterm setaf 7)
+RESET  := $(shell tput -Txterm sgr0)
+
+
+TARGET_MAX_CHARS=30
+## Show help
+help:
+	@echo ''
+	@echo 'Usage:'
+	@echo '  ${YELLOW}make${RESET} ${GREEN}<target>${RESET}'
+	@echo ''
+	@echo 'Targets:'
+	@awk '/^[a-zA-Z\-_0-9]+:/ { \
+		targetHelp = match(lastLine, /^## (.*)/); \
+		if (targetHelp) { \
+			target = substr($$1, 0, index($$1, ":")-1); \
+			targetHelp = substr(lastLine, RSTART + 3, RLENGTH); \
+			printf "  ${YELLOW}%-$(TARGET_MAX_CHARS)s${RESET} ${GREEN}%s${RESET}\n", target, targetHelp; \
+		} \
+	} \
+	{ lastLine = $$0 }' $(MAKEFILE_LIST)

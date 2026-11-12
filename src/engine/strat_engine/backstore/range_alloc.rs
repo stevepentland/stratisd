@@ -14,15 +14,15 @@ use crate::{
     stratis::{StratisError, StratisResult},
 };
 
-#[derive(Debug)]
 /// A structure that keeps a bunch of segments organized by their initial
 /// index. This is principally useful for the range allocator.
 /// It enforces some invariants:
 /// * No 0 length segment
-/// * No continguous segments; if two segments would be contiguous they are
-/// coalesced into a single segment.
+/// * No contiguous segments; if two segments would be contiguous they are
+///   coalesced into a single segment.
 /// * No overlapping segments
 /// * No segments that extend beyond limit
+#[derive(Debug, Clone)]
 pub struct PerDevSegments {
     // the end, no sectors can be allocated beyond this point
     limit: Sectors,
@@ -44,6 +44,7 @@ impl PerDevSegments {
     }
 
     /// The number of distinct ranges
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.used.len()
     }
@@ -112,8 +113,7 @@ impl PerDevSegments {
             end
         } else {
             return Err(StratisError::Msg(format!(
-                "range ({}, {}) extends beyond maximum possible size",
-                start, len
+                "range ({start}, {len}) extends beyond maximum possible size"
             )));
         };
 
@@ -130,8 +130,7 @@ impl PerDevSegments {
             let prev_len: Sectors = *self.used.get(&prev).expect("see precondition");
             if prev + prev_len > start {
                 return Err(StratisError::Msg(format!(
-                    "range to add ({}, {}) overlaps previous range ({}, {})",
-                    start, len, prev, prev_len
+                    "range to add ({start}, {len}) overlaps previous range ({prev}, {prev_len})"
                 )));
             }
 
@@ -147,8 +146,7 @@ impl PerDevSegments {
         let (res, rhs) = if let Some(next) = next {
             if new_start + new_len > next {
                 return Err(StratisError::Msg(format!(
-                    "range to add ({}, {}) overlaps subsequent range starting at {}",
-                    new_start, new_len, next
+                    "range to add ({new_start}, {new_len}) overlaps subsequent range starting at {next}"
                 )));
             }
 
@@ -293,8 +291,7 @@ impl PerDevSegments {
         assert!(self
             .used
             .iter()
-            .rev()
-            .next()
+            .next_back()
             .map(|(s, l)| *s + *l <= self.limit)
             .unwrap_or(true));
         // The complement really is the complement
@@ -318,6 +315,12 @@ impl<'a> Iterator for Iter<'a> {
     }
 }
 
+impl DoubleEndedIterator for Iter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.items.next_back()
+    }
+}
+
 #[derive(Debug)]
 pub struct RangeAllocator {
     segments: PerDevSegments,
@@ -336,6 +339,7 @@ impl RangeAllocator {
     }
 
     /// The maximum allocation from this manager
+    #[cfg(test)]
     pub fn size(&self) -> BlockdevSize {
         BlockdevSize::new(self.segments.limit())
     }
@@ -350,22 +354,9 @@ impl RangeAllocator {
         self.segments.sum()
     }
 
-    #[allow(dead_code)]
-    /// Just allocate all the sectors that are available.
-    pub fn request_all(&mut self) -> PerDevSegments {
-        let segs = self.segments.complement();
-
-        let mut temp = PerDevSegments::new(self.segments.limit);
-        temp.insert(&(Sectors(0), self.segments.limit))
-            .expect("exactly one segment to fill whole range");
-        self.segments = temp;
-
-        segs
-    }
-
-    /// Attempt to allocate.
+    /// Attempt to allocate from the front of the device.
     /// Returns a PerDevSegments object containing the allocated ranges.
-    pub fn request(&mut self, amount: Sectors) -> PerDevSegments {
+    pub fn alloc_front(&mut self, amount: Sectors) -> PerDevSegments {
         let mut segs = PerDevSegments::new(self.segments.limit());
         let mut needed = amount;
 
@@ -379,37 +370,45 @@ impl RangeAllocator {
                 .expect("wholly disjoint from other elements in segs");
             needed -= to_use;
         }
-
         self.segments = self
             .segments
             .union(&segs)
             .expect("all segments verified to be in available ranges");
+
         segs
     }
 
-    #[cfg(test)]
-    fn invariant(&self) {
-        // Verify that calling request_all() has the identical effect to
-        // calling request() and requesting all available.
-        let mut dup1 = RangeAllocator {
-            segments: PerDevSegments {
-                limit: self.segments.limit,
-                used: self.segments.used.clone(),
-            },
-        };
-        let mut dup2 = RangeAllocator {
-            segments: PerDevSegments {
-                limit: self.segments.limit,
-                used: self.segments.used.clone(),
-            },
-        };
-        let result1 = dup1.request_all();
-        let result2 = dup2.request(dup2.available());
-        assert_eq!(result1.limit, result2.limit);
-        assert_eq!(result1.used, result2.used);
+    /// Attempt to allocate from the back of the device.
+    /// Returns a PerDevSegments object containing the allocated ranges.
+    #[allow(dead_code)]
+    pub fn alloc_back(&mut self, amount: Sectors) -> PerDevSegments {
+        let mut segs = PerDevSegments::new(self.segments.limit());
+        let mut needed = amount;
 
-        assert_eq!(dup1.available(), Sectors(0));
-        assert_eq!(dup2.available(), Sectors(0));
+        for (&start, &len) in self.segments.complement().iter().rev() {
+            if needed == Sectors(0) {
+                break;
+            }
+            let to_use = min(needed, len);
+            let used_range = (start + len - to_use, to_use);
+            segs.insert(&used_range)
+                .expect("wholly disjoint from other elements in segs");
+            needed -= to_use;
+        }
+        self.segments = self
+            .segments
+            .union(&segs)
+            .expect("all segments verified to be in available ranges");
+
+        segs
+    }
+
+    /// Increase the available size of the RangeAlloc data structure.
+    ///
+    /// Precondition: new_size > self.limit
+    pub fn increase_size(&mut self, new_size: Sectors) {
+        assert!(new_size > self.segments.limit);
+        self.segments.limit = new_size;
     }
 }
 
@@ -442,17 +441,15 @@ mod tests {
         assert_eq!(allocator.used(), Sectors(100));
         assert_eq!(allocator.available(), Sectors(28));
 
-        let request = allocator.request(Sectors(50));
-        assert_eq!(request.len(), 2);
-        assert_eq!(request.sum(), Sectors(28));
+        let seg = allocator.alloc_front(Sectors(50));
+        assert_eq!(seg.len(), 2);
+        assert_eq!(seg.sum(), Sectors(28));
         assert_eq!(allocator.used(), Sectors(128));
         assert_eq!(allocator.available(), Sectors(0));
 
         let available = allocator.available();
-        allocator.request(available);
+        allocator.alloc_front(available);
         assert_eq!(allocator.available(), Sectors(0));
-
-        allocator.invariant();
     }
 
     #[test]
@@ -472,7 +469,6 @@ mod tests {
             allocator.used.iter().next().unwrap(),
             (&Sectors(10), &Sectors(30))
         );
-        allocator.invariant();
     }
 
     #[test]
@@ -496,9 +492,7 @@ mod tests {
     /// Verify that the largest possible limit may be used for the
     /// allocator.
     fn test_max_allocator_range() {
-        use std::u64::MAX;
-
-        PerDevSegments::new(Sectors(MAX));
+        PerDevSegments::new(Sectors(u64::MAX));
     }
 
     #[test]
@@ -525,10 +519,10 @@ mod tests {
     fn test_allocator_failures_range_overwrite() {
         let mut allocator = RangeAllocator::new(BlockdevSize::new(Sectors(128)), &[]).unwrap();
 
-        let request = allocator.request(Sectors(128));
+        let seg = allocator.alloc_front(Sectors(128));
         assert_eq!(allocator.used(), Sectors(128));
         assert_eq!(
-            request.iter().collect::<Vec<_>>(),
+            seg.iter().collect::<Vec<_>>(),
             vec![(&Sectors(0), &Sectors(128))]
         );
 
@@ -538,8 +532,6 @@ mod tests {
             allocator.segments.insert_all(&[(Sectors(1), Sectors(1))]),
             Err(_)
         );
-
-        allocator.invariant();
     }
 
     #[test]
@@ -557,12 +549,10 @@ mod tests {
     /// Verify that insert() errors when an element in a requested range
     /// exceeds u64::MAX.
     fn test_allocator_failures_overflow_max() {
-        use std::u64::MAX;
-
-        let mut allocator = PerDevSegments::new(Sectors(MAX));
+        let mut allocator = PerDevSegments::new(Sectors(u64::MAX));
 
         // overflow max u64
-        assert_matches!(allocator.insert(&(Sectors(MAX), Sectors(1))), Err(_));
+        assert_matches!(allocator.insert(&(Sectors(u64::MAX), Sectors(1))), Err(_));
         allocator.invariant();
     }
 

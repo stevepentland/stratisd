@@ -16,21 +16,9 @@ with `stratisd`.
 
 See [https://stratis-storage.github.io/](https://stratis-storage.github.io/).
 
-## Getting involved
+## Mailing list
 
-### Communication channels
-
-If you have questions, please don't hesitate to ask them, either on the mailing list or
-IRC.
-
-#### Mailing list
-
-Development mailing list: stratis-devel@lists.fedorahosted.org, -- subscribe
-[here](https://lists.fedoraproject.org/admin/lists/stratis-devel.lists.fedorahosted.org/).
-
-#### IRC
-
-irc.freenode.net #stratis-storage.
+Mailing list: stratis-devel@lists.fedorahosted.org — [subscribe or manage your subscription](https://lists.fedoraproject.org/admin/lists/stratis-devel.lists.fedorahosted.org/).
 
 ## For Developers
 
@@ -127,18 +115,6 @@ run them, see [`README_tests.md`](README_tests.md).
 ##### Test that interact with stratisd via the D-Bus
 For a description of the D-Bus-based tests see
 [`tests/client-dbus/README.rst`](tests/client-dbus/README.rst).
-
-## Allowed Bugs
-`stratisd` has some bugs; most of these we intend to address in due course.
-
-There is one bug that we have chosen not to fix. This is a bug in our D-Bus
-layer that will allow incorrect un-marshalling of certain D-Bus values if
-a D-Bus method is invoked with arguments that do not conform to the expected
-signature of the method.  See
-[the GitHub issue](https://github.com/stratis-storage/project/issues/11) for
-additional details about this bug. Behavior of `stratisd` is undefined if a
-method is called under the particular circumstances that allow the bug to
-manifest.
 
 ## Licensing
 

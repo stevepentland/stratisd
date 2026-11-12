@@ -1,7 +1,17 @@
 #!/usr/bin/sh
 
-make fmt-travis && make build && make build-extras && make build-min && make test && make clippy && make yamllint || exit 1
+export PROFILEDIR=debug
 
-export PYTHONPATH=$PWD/tests/client-dbus/src
+make fmt-ci &&
+	make fmt-shell-ci &&
+	make stratisd &&
+	make stratisd-tools &&
+	make build-min &&
+	make build-no-ipc &&
+	make test &&
+	make clippy &&
+	make yamllint &&
+	make tmtlint &&
+	make check-typos || exit 1
 
-cd tests/client-dbus && make fmt-travis && make lint || exit 1
+cd tests/client-dbus && make fmt-ci && make lint || exit 1

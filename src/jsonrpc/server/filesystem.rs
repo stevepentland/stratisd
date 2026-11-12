@@ -2,41 +2,47 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+use std::sync::Arc;
+
 use chrono::SecondsFormat;
 use tokio::task::block_in_place;
 
+use devicemapper::Bytes;
+
 use crate::{
-    engine::{Engine, EngineAction, Filesystem, LockableEngine, Name, Pool},
-    jsonrpc::{interface::FsListType, server::utils::name_to_uuid_and_pool},
+    engine::{Engine, EngineAction, Name, PoolIdentifier},
+    jsonrpc::interface::FsListType,
     stratis::{StratisError, StratisResult},
 };
 
 // stratis-min filesystem create
-pub async fn filesystem_create<E>(
-    engine: LockableEngine<E>,
-    pool_name: &str,
-    name: &str,
-) -> StratisResult<bool>
-where
-    E: Engine,
-{
-    let mut lock = engine.lock().await;
-    let (pool_uuid, pool) = name_to_uuid_and_pool(&mut *lock, pool_name)
-        .ok_or_else(|| StratisError::Msg(format!("No pool named {} found", pool_name)))?;
+pub async fn filesystem_create<'a>(
+    engine: Arc<dyn Engine>,
+    pool_name: &'a str,
+    name: &'a str,
+    size: Option<u128>,
+    size_limit: Option<u128>,
+) -> StratisResult<bool> {
+    let mut guard = engine
+        .get_mut_pool(PoolIdentifier::Name(Name::new(pool_name.to_owned())))
+        .await
+        .ok_or_else(|| StratisError::Msg(format!("No pool named {pool_name} found")))?;
+    let (_, pool_uuid, pool) = guard.as_mut_tuple();
     block_in_place(|| {
         Ok(pool
-            .create_filesystems(pool_name, pool_uuid, &[(name, None)])?
+            .create_filesystems(
+                pool_name,
+                pool_uuid,
+                &[(name, size.map(Bytes), size_limit.map(Bytes))],
+            )?
             .is_changed())
     })
 }
 
 // stratis-min filesystem [list]
-pub async fn filesystem_list<E>(engine: LockableEngine<E>) -> FsListType
-where
-    E: Engine,
-{
-    let lock = engine.lock().await;
-    lock.pools().into_iter().fold(
+pub async fn filesystem_list(engine: Arc<dyn Engine>) -> FsListType {
+    let guard = engine.pools().await;
+    guard.iter().fold(
         (
             Vec::new(),
             Vec::new(),
@@ -45,7 +51,7 @@ where
             Vec::new(),
             Vec::new(),
         ),
-        |mut acc, (name, _uuid, pool)| {
+        |mut acc, (name, _, pool)| {
             for (fs_name, uuid, fs) in pool.filesystems() {
                 acc.0.push(name.to_string());
                 acc.1.push(fs_name.to_string());
@@ -61,42 +67,79 @@ where
 }
 
 // stratis-min filesystem destroy
-pub async fn filesystem_destroy<E>(
-    engine: LockableEngine<E>,
-    pool_name: &str,
-    fs_name: &str,
-) -> StratisResult<bool>
-where
-    E: Engine,
-{
-    let mut lock = engine.lock().await;
-    let (_, pool) = name_to_uuid_and_pool(&mut *lock, pool_name)
-        .ok_or_else(|| StratisError::Msg(format!("No pool named {} found", pool_name)))?;
+pub async fn filesystem_destroy<'a>(
+    engine: Arc<dyn Engine>,
+    pool_name: &'a str,
+    fs_name: &'a str,
+) -> StratisResult<bool> {
+    let mut pool = engine
+        .get_mut_pool(PoolIdentifier::Name(Name::new(pool_name.to_owned())))
+        .await
+        .ok_or_else(|| StratisError::Msg(format!("No pool named {pool_name} found")))?;
     let (uuid, _) = pool
         .get_filesystem_by_name(&Name::new(fs_name.to_string()))
-        .ok_or_else(|| StratisError::Msg(format!("No filesystem named {} found", fs_name)))?;
-    block_in_place(|| Ok(pool.destroy_filesystems(pool_name, &[uuid])?.is_changed()))
+        .ok_or_else(|| StratisError::Msg(format!("No filesystem named {fs_name} found")))?;
+    block_in_place(|| {
+        Ok(pool
+            .destroy_filesystems(pool_name, &[uuid].into())?
+            .is_changed())
+    })
 }
 
 // stratis-min filesystem rename
-pub async fn filesystem_rename<E>(
-    engine: LockableEngine<E>,
-    pool_name: &str,
-    fs_name: &str,
-    new_fs_name: &str,
-) -> StratisResult<bool>
-where
-    E: Engine,
-{
-    let mut lock = engine.lock().await;
-    let (_, pool) = name_to_uuid_and_pool(&mut *lock, pool_name)
-        .ok_or_else(|| StratisError::Msg(format!("No pool named {} found", pool_name)))?;
+pub async fn filesystem_rename<'a>(
+    engine: Arc<dyn Engine>,
+    pool_name: &'a str,
+    fs_name: &'a str,
+    new_fs_name: &'a str,
+) -> StratisResult<bool> {
+    let mut pool = engine
+        .get_mut_pool(PoolIdentifier::Name(Name::new(pool_name.to_owned())))
+        .await
+        .ok_or_else(|| StratisError::Msg(format!("No pool named {pool_name} found")))?;
     let (uuid, _) = pool
         .get_filesystem_by_name(&Name::new(fs_name.to_string()))
-        .ok_or_else(|| StratisError::Msg(format!("No filesystem named {} found", fs_name)))?;
+        .ok_or_else(|| StratisError::Msg(format!("No filesystem named {fs_name} found")))?;
     block_in_place(|| {
         Ok(pool
             .rename_filesystem(pool_name, uuid, new_fs_name)?
+            .is_changed())
+    })
+}
+
+// stratis-min filesystem origin
+pub async fn filesystem_origin<'a>(
+    engine: Arc<dyn Engine>,
+    pool_name: &'a str,
+    fs_name: &'a str,
+) -> StratisResult<Option<String>> {
+    let pool = engine
+        .get_pool(PoolIdentifier::Name(Name::new(pool_name.to_owned())))
+        .await
+        .ok_or_else(|| StratisError::Msg(format!("No pool named {pool_name} found")))?;
+    let (_, fs) = pool
+        .get_filesystem_by_name(&Name::new(fs_name.to_string()))
+        .ok_or_else(|| StratisError::Msg(format!("No filesystem named {fs_name} found")))?;
+    Ok(fs.origin().map(|u| u.as_simple().to_string()))
+}
+
+// stratis-min filesystem set-size-limit
+pub async fn filesystem_set_size_limit<'a>(
+    engine: Arc<dyn Engine>,
+    pool_name: &'a str,
+    fs_name: &'a str,
+    size_limit: u128,
+) -> StratisResult<bool> {
+    let mut pool = engine
+        .get_mut_pool(PoolIdentifier::Name(Name::new(pool_name.to_owned())))
+        .await
+        .ok_or_else(|| StratisError::Msg(format!("No pool named {pool_name} found")))?;
+    let (uuid, _) = pool
+        .get_filesystem_by_name(&Name::new(fs_name.to_string()))
+        .ok_or_else(|| StratisError::Msg(format!("No filesystem named {fs_name} found")))?;
+    block_in_place(|| {
+        Ok(pool
+            .set_fs_size_limit(uuid, Some(Bytes(size_limit)))?
             .is_changed())
     })
 }

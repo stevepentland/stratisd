@@ -15,14 +15,11 @@
 Class to handle loop back devices.
 """
 
-# isort: STDLIB
 import os
 import subprocess
-import tempfile
 import time
 import uuid
 
-# isort: THIRDPARTY
 import pyudev
 
 UDEV_ADD_EVENT = "add"
@@ -30,7 +27,7 @@ UDEV_REMOVE_EVENT = "remove"
 
 _LOSETUP_BIN = os.getenv("STRATIS_LOSETUP_BIN", "/usr/sbin/losetup")
 
-_SIZE_OF_DEVICE = 1024 ** 4  # 1 TiB
+_SIZE_OF_DEVICE = 1024**4  # 1 TiB
 
 
 def _generate_synthetic_udev_events(devnodes, event):
@@ -44,7 +41,7 @@ def _generate_synthetic_udev_events(devnodes, event):
     for device in devnodes:
         device_name = os.path.split(device)[-1]
         ufile = os.path.join("/sys/block", device_name, "uevent")
-        with open(ufile, "w") as uevent:
+        with open(ufile, "w", encoding="utf-8") as uevent:
             uevent.write(event)
 
 
@@ -59,7 +56,8 @@ class LoopBackDevices:
         Class constructor which creates a temporary directory to store backing
         file in.
         """
-        self.dir = tempfile.mkdtemp("_stratis_loop_back")
+        self.dir = os.path.join(os.environ["HOME"], ".stratis_loopback")
+        os.makedirs(self.dir, exist_ok=True)
         self.count = 0
         self.devices = {}
 
@@ -86,8 +84,8 @@ class LoopBackDevices:
             time.sleep(1)
 
         raise RuntimeError(
-            'Loopbacked devices "%s" were created, but udev does not seem to be able to find them'
-            % ", ".join(expected_device_files)
+            f'Loopbacked devices "{", ".join(expected_device_files)}" were created, '
+            f"but udev does not seem to be able to find them"
         )
 
     def create_devices(self, number):
@@ -97,13 +95,25 @@ class LoopBackDevices:
         Note: The first time a loop back device is known it will generate
         a udev "add" event, subsequent backing file changes do not, thus we
         will need to generate it synthetically.
+
+        If this is the absolute first time calling losetup for this sequence,
+        make an extra loop device and skip the first loop device created.
+
         :param int number: the number of devices to create
         :return: list of keys for the devices
         :rtype: list of uuid.UUID
         """
+        assert self.dir is not None
+
         tokens = []
+
+        first_creation = self.count == 0
+
+        if first_creation:
+            number = number + 1
+
         for _ in range(number):
-            backing_file = os.path.join(self.dir, "block_device_%d" % self.count)
+            backing_file = os.path.join(self.dir, f"block_device_{self.count}")
             self.count += 1
 
             with open(backing_file, "ab") as dev:
@@ -118,6 +128,9 @@ class LoopBackDevices:
             token = uuid.uuid4()
             self.devices[token] = (device, backing_file)
             tokens.append(token)
+
+        if first_creation:
+            tokens = tokens[1:]
 
         self._wait_for_udev(tokens)
         self.generate_synthetic_udev_events(tokens, UDEV_ADD_EVENT)
@@ -194,7 +207,7 @@ class LoopBackDevices:
         Detach loopbacks and remove backing files
         :return:
         """
-        for (device, backing_file) in self.devices.values():
+        for device, backing_file in self.devices.values():
             if device is not None:
                 subprocess.check_call([_LOSETUP_BIN, "-d", device])
             os.remove(backing_file)
@@ -207,6 +220,8 @@ class LoopBackDevices:
         Detach all the devices and delete the file(s) and directory!
         :return: None
         """
+        assert self.dir is not None
+
         self.destroy_devices()
         os.rmdir(self.dir)
         self.dir = None

@@ -1,272 +1,68 @@
 ---
 name: stratisd CI
 
-# yamllint disable-line rule:truthy
 on:
   push:
     branches:
       - master
     paths-ignore:
-      - 'CHANGES.txt'
-      - '**/README.md'
-      - 'README_tests.md'
-      - 'tests/**'
+      - '.packit.yaml'
+      - 'plans/**'
+      - 'tests-fmf/**'
   pull_request:
     branches:
       - master
     paths-ignore:
-      - 'CHANGES.txt'
-      - '**/README.md'
-      - 'README_tests.md'
-      - 'tests/**'
+      - '.packit.yaml'
+      - 'plans/**'
+      - 'tests-fmf/**'
 
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+
+# cancel the in-progress workflow when PR is refreshed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
+  cancel-in-progress: true
 
 jobs:
   checks:
     strategy:
       matrix:
         include:
-          # MANDATORY CHECKS USING CURRENT DEVELOPMENT COMPILER
-          - task: make -f Makefile fmt-travis
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
+          - task: make -f Makefile fmt-ci
             components: rustfmt
-            image: ubuntu:groovy
-          - task: make -f Makefile clippy
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: clippy
-            image: ubuntu:groovy
-          - task: make -f Makefile fmt-travis
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: rustfmt
-            image: fedora:34  # CURRENT DEVELOPMENT ENVIRONMENT
-          - task: make -f Makefile clippy
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: clippy
-            image: fedora:34  # CURRENT DEVELOPMENT ENVIRONMENT
-          - task: make -f Makefile build
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: cargo
-            image: ubuntu:groovy
-          - task: make -f Makefile build-min
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: cargo
-            image: ubuntu:groovy
-          - task: make -f Makefile build-extras
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: cargo
-            image: ubuntu:groovy
-          - task: make -f Makefile docs-travis
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: cargo
-            image: ubuntu:groovy
-          - task: make -f Makefile test
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: cargo
-            image: ubuntu:groovy
-          - task: make -f Makefile release
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: cargo
-            image: ubuntu:groovy
-          - task: make -f Makefile release-min
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: cargo
-            image: ubuntu:groovy
-          - task: make -f Makefile build
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: cargo
-            image: fedora:34  # CURRENT DEVELOPMENT ENVIRONMENT
-          - task: make -f Makefile build-min
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: cargo
-            image: fedora:34  # CURRENT DEVELOPMENT ENVIRONMENT
-          - task: make -f Makefile build-extras
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: cargo
-            image: fedora:34  # CURRENT DEVELOPMENT ENVIRONMENT
-          - task: make -f Makefile docs-travis
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: cargo
-            image: fedora:34  # CURRENT DEVELOPMENT ENVIRONMENT
-          - task: make -f Makefile test
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: cargo
-            image: fedora:34  # CURRENT DEVELOPMENT ENVIRONMENT
-          - task: make -f Makefile release
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: cargo
-            image: fedora:34  # CURRENT DEVELOPMENT ENVIRONMENT
-          - task: make -f Makefile release-min
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: cargo
-            image: fedora:34  # CURRENT DEVELOPMENT ENVIRONMENT
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-24.04
     container:
-      image: ${{ matrix.image }}
+      image: fedora:44  # CURRENT DEVELOPMENT ENVIRONMENT
       options: --privileged -v /dev:/dev
     steps:
-      - uses: actions/checkout@v2
-      - name: Install dependencies for Ubuntu
-        run: apt-get -q update
-        if: matrix.image == 'ubuntu:groovy'
-      - name: Install dependencies for Ubuntu
-        run: >
-          DEBIAN_FRONTEND=noninteractive
-          apt-get install -y
-          clang
-          curl
-          libblkid-dev
-          libcryptsetup-dev
-          libdbus-1-dev
-          libsystemd-dev
-          libudev-dev
-          make
-        if: matrix.image == 'ubuntu:groovy'
       - name: Install dependencies for Fedora
         run: >
           dnf install -y
           clang
           curl
           cryptsetup-devel
-          dbus-devel
+          device-mapper-devel
+          git
           libblkid-devel
           make
+          ncurses
           systemd-devel
-        if: matrix.image == 'fedora:34'
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: ${{ matrix.components }}
-          toolchain: ${{ matrix.toolchain }}
-          override: true
-      - name: Test ${{ matrix.task }} on ${{ matrix.toolchain }} toolchain
-        run: ${{ matrix.task }}
-
-  # TESTS WITH UDEV
-  checks_with_udev:
-    strategy:
-      matrix:
-        include:
-          # MANDATORY CHECKS USING CURRENT DEVELOPMENT COMPILER
-          - task: RUST_LOG=stratisd=debug make -f Makefile test-loop
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: cargo
-            image: ubuntu:groovy
-          - task: RUST_LOG=stratisd=debug make -f Makefile test-loop
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: cargo
-            image: fedora:34  # CURRENT DEVELOPMENT ENVIRONMENT
-    runs-on: ubuntu-18.04
-    container:
-      image: ${{ matrix.image }}
-      options: --privileged -v /dev:/dev
-    steps:
-      - uses: actions/checkout@v2
-      - name: Install dependencies for Ubuntu
-        run: apt-get -q update
-        if: matrix.image == 'ubuntu:groovy'
-      - name: Install dependencies for Ubuntu
-        run: >
-          DEBIAN_FRONTEND=noninteractive
-          apt-get install -y
-          asciidoc
-          clang
-          curl
-          libblkid-dev
-          libcryptsetup-dev
-          libdbus-1-dev
-          libsystemd-dev
-          libudev-dev
-          make
-          systemd
-          thin-provisioning-tools
-          udev
-          xfsprogs
-        if: matrix.image == 'ubuntu:groovy'
-      - name: Install dependencies for Fedora
-        run: >
-          dnf install -y
-          asciidoc
-          clang
-          cryptsetup-devel
-          curl
-          device-mapper-persistent-data
-          dbus-devel
-          libblkid-devel
-          make
-          systemd-devel
-          systemd-udev
-          xfsprogs
-        if: matrix.image == 'fedora:34'
-      - uses: actions-rs/toolchain@v1
-        with:
-          components: ${{ matrix.components }}
-          toolchain: ${{ matrix.toolchain }}
-          override: true
-      - name: Install all necessary Stratis files
-        run: make install
-      - name: Start udev
-        run: /usr/lib/systemd/systemd-udevd &
-      - name: Test ${{ matrix.task }} on ${{ matrix.toolchain }} toolchain
-        run: ${{ matrix.task }}
-
-  # TESTS WITH TANG
-  checks_with_tang:
-    strategy:
-      matrix:
-        include:
-          # MANDATORY CHECKS USING CURRENT DEVELOPMENT COMPILER
-          - task: >-
-              TANG_URL=tang
-              RUST_LOG=stratisd=debug
-              make -f Makefile test-clevis-loop
-            toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-            components: cargo
-            image: fedora:34  # CURRENT DEVELOPMENT ENVIRONMENT
-    runs-on: ubuntu-18.04
-    container:
-      image: ${{ matrix.image }}
-      options: --privileged -v /dev:/dev
-    services:
-      tang:
-        # yamllint disable rule:line-length
-        image: docker.pkg.github.com/stratis-storage/stratisd/tang:34  # CURRENT DEVELOPMENT ENVIRONMENT
-        credentials:
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-        options: --privileged -p 80:80
-    steps:
-      - uses: actions/checkout@v2
-      - name: Install dependencies for Fedora
-        run: >
-          dnf install -y
-          clang
-          cryptsetup-devel
-          clevis
-          clevis-luks
-          curl
-          device-mapper-persistent-data
-          dbus-devel
-          libblkid-devel
-          make
-          systemd-devel
-          systemd-udev
-          xfsprogs
-      - name: Start udev
-        run: /usr/lib/systemd/systemd-udevd &
-      - uses: actions-rs/toolchain@v1
-        with:
-          components: ${{ matrix.components }}
-          toolchain: ${{ matrix.toolchain }}
-          override: true
-      - name: Test ${{ matrix.task }} on ${{ matrix.toolchain }} toolchain
+      - name: Test ${{ matrix.task }} on CURRENT DEVELOPMENT RUST TOOLCHAIN
         run: ${{ matrix.task }}
 
   stratis-cli-checks:
-    runs-on: ubuntu-18.04
-    container: fedora:30  # LOWEST SUPPORTED ENVIRONMENT PROXY
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:44  # CURRENT DEVELOPMENT ENVIRONMENT
+      options: --privileged --userns=host --ipc=host -v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket:ro -v /usr/share/dbus-1:/usr/share/dbus-1
     steps:
-      - uses: actions/checkout@v2
       - name: Install dependencies
         run: >
           dnf install -y
@@ -275,121 +71,282 @@ jobs:
           cryptsetup-devel
           dbus-daemon
           dbus-tools
-          dbus-devel
-          libblkid-devel
+          device-mapper-devel
           git
+          glibc-static
+          jq
+          libblkid-devel
           make
+          ncurses
           python3-coverage
           python3-dbus-client-gen
           python3-dbus-python-client-gen
           python3-justbytes
-          python3-dateutil
           python3-packaging
           python3-psutil
+          python3-wcwidth
           systemd-devel
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v6
+        with:
+          path: stratisd
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: cargo
-          toolchain: 1.54.0  # LOWEST SUPPORTED RUST TOOLCHAIN
-          override: true
+      - name: Overwrite stratisd dependencies as necessary
+        uses: stratis-storage/github-actions/stratisd-modify@HEAD
+        with:
+          working-directory: stratisd
+      - name: Set toolchain to MSRV
+        uses: stratis-storage/github-actions/set-rust-toolchain@HEAD
+        with:
+          working-directory: stratisd
       - name: Build stratisd
+        run: PROFILEDIR=debug make -f Makefile build-all
+        working-directory: stratisd
+      - name: Install stratisd
         run: PROFILEDIR=debug make -f Makefile install
-      - name: Check out stratis-cli
-        run: git clone https://github.com/stratis-storage/stratis-cli.git
-      - name: Set up for D-Bus
-        run: |
-          mkdir -p /var/lib/dbus
-          dbus-uuidgen > /var/lib/dbus/machine-id
-          mkdir -p /var/run/dbus
-      - name: Start D-Bus
-        run: >
-          dbus-daemon
-          --config-file=/usr/share/dbus-1/system.conf
-          --print-address
+        working-directory: stratisd
+      - name: Workaround for dbus inotify
+        run: cp stratisd.conf /usr/share/dbus-1/system.d
+        working-directory: stratisd
+      - uses: stratis-storage/github-actions/github-modify@HEAD
+        with:
+          repo: stratis-cli
+      - name: Print head commit
+        run: git log --oneline -1
+        working-directory: stratis-cli
       - name: Run stratis-cli tests
         run: >
           RUST_LOG=stratisd=debug
           STRATISD=/usr/libexec/stratisd
           PYTHONPATH=./src
           make dbus-tests
-        working-directory: ./stratis-cli
+        working-directory: stratis-cli
 
-  shell-checks:
-    runs-on: ubuntu-18.04
+  stratis-min-cli-checks:
+    runs-on: ubuntu-24.04
     container:
-      image: fedora:34  # CURRENT DEVELOPMENT ENVIRONMENT
+      image: fedora:44  # CURRENT DEVELOPMENT ENVIRONMENT
+      options: --privileged --userns=host --ipc=host -v /dev:/dev -v /run/udev:/run/udev -v /usr/lib/udev:/usr/lib/udev -v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket:ro -v /usr/share/dbus-1:/usr/share/dbus-1
     steps:
-      - uses: actions/checkout@v2
       - name: Install dependencies
         run: >
           dnf install -y
+          asciidoc
+          clang
+          cryptsetup
+          cryptsetup-devel
+          dbus-daemon
+          dbus-tools
+          device-mapper-devel
+          device-mapper-persistent-data
+          git
+          glibc-static
+          libblkid-devel
           make
+          ncurses
+          python3-coverage
+          python3-dbus-client-gen
+          python3-dbus-python-client-gen
+          python3-justbytes
+          python3-packaging
+          python3-psutil
+          python3-wcwidth
+          systemd-devel
+          xfsprogs
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: cargo
+      - name: Overwrite stratisd dependencies as necessary
+        uses: stratis-storage/github-actions/stratisd-modify@HEAD
+      - name: Run stratisd-min cli tests
+        run: make test-stratisd-min-root
+      - name: Run stratis-min cli tests
+        run: make test-stratis-min-root
+      - name: Run stratis-tools tests
+        run: make test-stratisd-tools
+      - name: Run stratis-utils tests
+        run: make test-stratis-utils
+
+  shell-checks:
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:44  # CURRENT DEVELOPMENT ENVIRONMENT
+    steps:
+      - name: Install dependencies
+        run: >
+          dnf install -y
+          git
+          make
+          ncurses
           shfmt
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Run shell check
         run: make -f Makefile fmt-shell-ci
 
-  checks-with-ci-repo:
+  python-based-tests:
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:44  # CURRENT DEVELOPMENT ENVIRONMENT
+      options: --privileged -v /dev:/dev
+    steps:
+      - name: Install dependencies for Fedora
+        run: >
+          dnf install -y
+          asciidoc
+          clang
+          cryptsetup-devel
+          curl
+          dbus-tools
+          device-mapper-devel
+          device-mapper-persistent-data
+          git
+          glibc-static
+          libblkid-devel
+          make
+          ncurses
+          python3-justbytes
+          systemd-devel
+          systemd-udev
+          xfsprogs
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: cargo
+      - name: Overwrite stratisd dependencies as necessary
+        uses: stratis-storage/github-actions/stratisd-modify@HEAD
+      - name: Build stratisd
+        run: PROFILEDIR=debug make -f Makefile build-all
+      - name: Install stratisd
+        run: PROFILEDIR=debug make -f Makefile install
+      - name: Check basic behavior of test_predict
+        run: >
+          STRATIS_PREDICT_USAGE=/usr/bin/stratis-predict-usage
+          PYTHONPATH=./src
+          make filesystem-predict-tests
+        working-directory: ./tests/client-dbus
+
+  tests-with-testing-repo:
     strategy:
       matrix:
         include:
-          - task: >
-              SET_LOWER_BOUNDS=./set_lower_bounds
-              MANIFEST_PATH=../../stratisd_proc_macros/Cargo.toml
-              make -f ../../Makefile verify-dependency-bounds
-          - task: >
-              SET_LOWER_BOUNDS=./set_lower_bounds
-              MANIFEST_PATH=../../Cargo.toml
-              make -f ../../Makefile verify-dependency-bounds
-    runs-on: ubuntu-18.04
-    container:
-      image: fedora:34  # CURRENT DEVELOPMENT ENVIRONMENT
+          - rev: master
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v2
-      - name: Install dependencies for Fedora
+      - name: Run apt-get update
+        run: sudo apt-get -q update
+      - name: Install dependencies
         run: >
-          dnf install -y
+          DEBIAN_FRONTEND=noninteractive
+          sudo apt-get install -y
+          asciidoc
           clang
           curl
-          cryptsetup-devel
-          dbus-devel
           git
-          libblkid-devel
+          jq
+          libblkid-dev
+          libcryptsetup-dev
+          libdevmapper-dev
+          libsystemd-dev
+          libudev-dev
           make
-          openssl-devel
-          python-requests
-          python-semantic_version
-          systemd-devel
-      - uses: actions-rs/toolchain@v1
+          pip
+          pkg-config
+          thin-provisioning-tools
+          udev
+          xfsprogs
+      - name: Install Python dependencies
+        run: >
+          sudo python -m pip install
+          dbus-python
+          dbus-python-client-gen
+          justbytes
+          psutil
+      - uses: actions/checkout@v6
+        with:
+          path: stratisd
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: cargo
-          toolchain: 1.56.1  # CURRENT DEVELOPMENT RUST TOOLCHAIN
-          override: true
-      - name: Check out ci repo
-        run: git clone https://github.com/stratis-storage/ci.git
-      - name: Run ${{ matrix.task }}
-        run: ${{ matrix.task }}
-        working-directory: ./ci/dependency_management
+      - name: Overwrite stratisd dependencies as necessary
+        uses: stratis-storage/github-actions/stratisd-modify@HEAD
+        with:
+          working-directory: stratisd
+      - name: Set toolchain to MSRV
+        uses: stratis-storage/github-actions/set-rust-toolchain@HEAD
+        with:
+          working-directory: stratisd
+      - name: Build stratisd
+        run: PROFILEDIR=debug make -f Makefile build-all
+        working-directory: stratisd
+      - name: Install stratisd
+        run: sudo make PROFILEDIR=debug -f Makefile install
+        working-directory: stratisd
+      - name: Workaround for dbus inotify
+        run: sudo cp stratisd.conf /usr/share/dbus-1/system.d
+        working-directory: stratisd
+      - name: Reload udev
+        run: sudo udevadm control --reload
+      - uses: stratis-storage/github-actions/github-modify@HEAD
+        with:
+          repo: testing
+      - name: Run stratisd_cert.py
+        run: >
+          sudo
+          RUST_LOG=stratisd=debug
+          python3 test_harness.py --log-level=debug
+          stratisd_cert
+          --post-test-check=monitor-dbus
+          --post-test-check=verify-sysfs
+          --post-test-check=verify-private-symlinks
+          --post-test-check=verify-filesystem-symlinks
+          --post-test-check=verify-pool-metadata
+          --highest-revision-number=9
+        working-directory: testing
 
-  expand-macros:
-    continue-on-error: true
-    runs-on: ubuntu-18.04
+  systemd-checks:
+    runs-on: ubuntu-24.04
     container:
-      image: fedora:34  # CURRENT DEVELOPMENT ENVIRONMENT
+      image: fedora:44  # CURRENT DEVELOPMENT ENVIRONMENT
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          components: cargo
-          toolchain: nightly  # cargo expand can only be run on nightly
-          override: true
-      - name: Install dependencies for Fedora
+      - name: Install dependencies
         run: >
           dnf install -y
+          asciidoc
           clang
           cryptsetup-devel
-          dbus-devel
+          dbus-daemon
+          dbus-tools
+          device-mapper-devel
+          git
+          glibc-static
           libblkid-devel
           make
+          man-db
+          man-pages
+          ncurses
+          systemd
           systemd-devel
-      - name: Run cargo expand test
-        run: make -f Makefile expand
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: cargo
+      - name: Overwrite stratisd dependencies as necessary
+        uses: stratis-storage/github-actions/stratisd-modify@HEAD
+      - name: Build stratisd
+        run: PROFILEDIR=debug make -f Makefile build-all
+      - name: Install stratisd
+        run: PROFILEDIR=debug make -f Makefile install
+      - name: Lint systemd configuration
+        run: make -f Makefile systemd-lint

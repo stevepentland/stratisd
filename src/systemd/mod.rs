@@ -13,7 +13,7 @@ use crate::stratis::{StratisError, StratisResult};
 fn serialize_pairs(pairs: HashMap<String, String>) -> String {
     pairs
         .iter()
-        .map(|(key, value)| format!("{}={}", key, value))
+        .map(|(key, value)| format!("{key}={value}"))
         .fold(String::new(), |mut string, key_value_pair| {
             string += key_value_pair.as_str();
             string += "\n";
@@ -26,9 +26,9 @@ fn serialize_pairs(pairs: HashMap<String, String>) -> String {
 pub fn notify(unset_variable: bool, key_value_pairs: HashMap<String, String>) -> StratisResult<()> {
     let serialized_pairs = serialize_pairs(key_value_pairs);
     let cstring = CString::new(serialized_pairs)?;
-    let ret = unsafe { bindings::sd_notify(unset_variable as libc::c_int, cstring.as_ptr()) };
+    let ret = unsafe { bindings::sd_notify(libc::c_int::from(unset_variable), cstring.as_ptr()) };
     if ret < 0 {
-        Err(StratisError::Io(io::Error::from_raw_os_error(-ret)))
+        Err(StratisError::from(io::Error::from_raw_os_error(-ret)))
     } else {
         Ok(())
     }

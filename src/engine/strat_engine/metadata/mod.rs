@@ -17,8 +17,9 @@ mod static_header;
 
 pub use self::{
     bda::BDA,
-    sizes::{BDAExtendedSize, BlockdevSize, MDADataSize},
+    sizes::{BlockdevSize, MDADataSize},
     static_header::{
-        device_identifiers, disown_device, StaticHeader, StaticHeaderResult, StratisIdentifiers,
+        device_identifiers, disown_device, static_header, MetadataLocation, StaticHeader,
+        StaticHeaderResult, StratisIdentifiers,
     },
 };

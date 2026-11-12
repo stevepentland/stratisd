@@ -4,16 +4,15 @@
 
 // Functions for dealing with stratis and device mapper names.
 
-use std::{
-    convert::TryFrom,
-    fmt::{self, Display},
-};
+use std::fmt::{self, Display};
+
+use strum_macros::{self};
 
 use devicemapper::{DmNameBuf, DmUuidBuf};
 
 pub use crate::engine::types::KeyDescription;
 use crate::{
-    engine::types::{DevUuid, FilesystemUuid, PoolUuid},
+    engine::types::{DevUuid, FilesystemUuid, PoolUuid, VolumeKeyKeyDescription},
     stratis::StratisResult,
 };
 
@@ -22,7 +21,7 @@ const FORMAT_VERSION: u16 = 1;
 /// Prefix for the key descriptions added into the kernel keyring to indicate
 /// that they were added by Stratis.
 fn key_description_prefix() -> String {
-    format!("stratis-{}-key-", FORMAT_VERSION)
+    format!("stratis-{FORMAT_VERSION}-key-")
 }
 
 impl KeyDescription {
@@ -53,6 +52,12 @@ impl KeyDescription {
     }
 }
 
+impl VolumeKeyKeyDescription {
+    pub fn to_system_string(&self) -> String {
+        format!("stratis-{FORMAT_VERSION}-vk-{}", self.uuid())
+    }
+}
+
 /// Get a devicemapper name from the device UUID.
 ///
 /// Prerequisite: len(format!("{}", FORMAT_VERSION)
@@ -64,31 +69,45 @@ impl KeyDescription {
 ///             < 128
 ///
 /// which is equivalent to len(format!("{}", FORMAT_VERSION) < 73
-pub fn format_crypt_name(dev_uuid: &DevUuid) -> String {
-    format!(
+pub fn format_crypt_name(dev_uuid: &DevUuid) -> DmNameBuf {
+    let value = format!(
         "stratis-{}-private-{}-crypt",
         FORMAT_VERSION,
         uuid_to_string!(dev_uuid)
-    )
+    );
+    DmNameBuf::new(value).expect("FORMAT_VERSION display length < 73")
 }
 
-#[derive(Clone, Copy)]
+/// Get a devicemapper name from the device UUID.
+///
+/// Prerequisite: len(format!("{}", FORMAT_VERSION)
+///             + len("stratis")                         7
+///             + len("private")                         7
+///             + len("crypt")                           5
+///             + num_dashes                             4
+///             + len(dev uuid)                          32
+///             < 128
+///
+/// which is equivalent to len(format!("{}", FORMAT_VERSION) < 73
+pub fn format_crypt_backstore_name(pool_uuid: &PoolUuid) -> DmNameBuf {
+    let value = format!(
+        "stratis-{}-private-{}-crypt",
+        FORMAT_VERSION,
+        uuid_to_string!(pool_uuid)
+    );
+    DmNameBuf::new(value).expect("FORMAT_VERSION display length < 73")
+}
+
+#[derive(Clone, Copy, strum_macros::Display)]
 pub enum FlexRole {
+    #[strum(serialize = "mdv")]
     MetadataVolume,
+    #[strum(serialize = "thindata")]
     ThinData,
+    #[strum(serialize = "thinmeta")]
     ThinMeta,
+    #[strum(serialize = "thinmetaspare")]
     ThinMetaSpare,
-}
-
-impl Display for FlexRole {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            FlexRole::MetadataVolume => write!(f, "mdv"),
-            FlexRole::ThinData => write!(f, "thindata"),
-            FlexRole::ThinMeta => write!(f, "thinmeta"),
-            FlexRole::ThinMetaSpare => write!(f, "thinmetaspare"),
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -104,21 +123,15 @@ impl Display for ThinRole {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, strum_macros::Display)]
+#[strum(serialize_all = "lowercase")]
 pub enum ThinPoolRole {
     Pool,
 }
 
-impl Display for ThinPoolRole {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            ThinPoolRole::Pool => write!(f, "pool"),
-        }
-    }
-}
-
 /// The various roles taken on by DM devices in the cache tier.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, strum_macros::Display)]
+#[strum(serialize_all = "lowercase")]
 pub enum CacheRole {
     /// The DM cache device, contains the other three devices.
     Cache,
@@ -128,17 +141,6 @@ pub enum CacheRole {
     MetaSub,
     /// The origin sub-device of the DM cache device, holds the actual data.
     OriginSub,
-}
-
-impl Display for CacheRole {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            CacheRole::Cache => write!(f, "cache"),
-            CacheRole::CacheSub => write!(f, "cachesub"),
-            CacheRole::MetaSub => write!(f, "metasub"),
-            CacheRole::OriginSub => write!(f, "originsub"),
-        }
-    }
 }
 
 /// Format a name & uuid for the flex layer.
@@ -242,8 +244,6 @@ pub fn format_backstore_ids(pool_uuid: PoolUuid, role: CacheRole) -> (DmNameBuf,
 
 #[cfg(test)]
 mod tests {
-    use std::convert::TryFrom;
-
     use super::*;
 
     #[test]

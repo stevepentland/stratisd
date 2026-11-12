@@ -2,294 +2,862 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::{convert::TryFrom, error::Error, path::PathBuf};
+use std::{collections::HashMap, error::Error, path::PathBuf};
 
-use clap::{App, Arg, ArgGroup, ArgMatches, SubCommand};
+use clap::{Arg, ArgAction, ArgGroup, Command};
 use serde_json::{json, Map, Value};
 
 use stratisd::{
-    engine::{EncryptionInfo, KeyDescription, PoolUuid, UnlockMethod, CLEVIS_TANG_TRUST_URL},
+    engine::{
+        InputEncryptionInfo, KeyDescription, Name, OptionalTokenSlotInput, PoolIdentifier,
+        PoolUuid, TokenUnlockMethod, CLEVIS_TANG_TRUST_URL,
+    },
     jsonrpc::client::{filesystem, key, pool, report},
     stratis::{StratisError, VERSION},
 };
 
-fn parse_args() -> App<'static, 'static> {
-    App::new("stratis-min")
+fn parse_size(s: &str) -> Result<u128, String> {
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (magnitude_str, units) = s.split_at(split);
+    let magnitude: u128 = magnitude_str
+        .parse()
+        .map_err(|_| "Ill-formed size: magnitude must be a decimal integer".to_string())?;
+    let multiplier = match units {
+        "B" => 1,
+        "KiB" => 1024,
+        "MiB" => 1024 * 1024,
+        "GiB" => 1024 * 1024 * 1024,
+        "TiB" => 1024u128.pow(4),
+        "PiB" => 1024u128.pow(5),
+        _ => {
+            return Err("Ill-formed size: units must be B, KiB, MiB, GiB, TiB, or PiB".to_string())
+        }
+    };
+    magnitude
+        .checked_mul(multiplier)
+        .ok_or_else(|| "Ill-formed size: byte count exceeds u128::MAX".to_string())
+}
+
+fn parse_args() -> Command {
+    Command::new("stratis-min")
         .version(VERSION)
-        .arg(
-            Arg::with_name("debug")
-                .long("--debug")
-                .takes_value(false)
-                .required(false),
-        )
+        .arg(Arg::new("debug").long("debug").num_args(0).required(false))
+        .subcommand_required(true)
+        .arg_required_else_help(true)
         .subcommands(vec![
-            SubCommand::with_name("key").subcommands(vec![
-                SubCommand::with_name("set")
+            Command::new("key").subcommands(vec![
+                Command::new("set")
                     .group(
-                        ArgGroup::with_name("key_method")
+                        ArgGroup::new("key_method")
                             .arg("capture_key")
                             .arg("keyfile_path")
                             .required(true),
                     )
-                    .arg(
-                        Arg::with_name("capture_key")
-                            .long("--capture-key")
-                            .takes_value(false),
-                    )
-                    .arg(
-                        Arg::with_name("keyfile_path")
-                            .long("--keyfile-path")
-                            .takes_value(true),
-                    )
-                    .arg(Arg::with_name("key_desc").required(true)),
-                SubCommand::with_name("list"),
-                SubCommand::with_name("unset").arg(Arg::with_name("key_desc").required(true)),
+                    .arg(Arg::new("capture_key").long("capture-key").num_args(0))
+                    .arg(Arg::new("keyfile_path").long("keyfile-path").num_args(1))
+                    .arg(Arg::new("key_desc").required(true)),
+                Command::new("list"),
+                Command::new("unset").arg(Arg::new("key_desc").required(true)),
             ]),
-            SubCommand::with_name("pool").subcommands(vec![
-                SubCommand::with_name("unlock")
-                    .arg(Arg::with_name("unlock_method").required(true))
-                    .arg(Arg::with_name("pool_uuid").required(false))
+            Command::new("pool").subcommands(vec![
+                Command::new("start")
+                    .arg(Arg::new("id").required(true))
+                    .arg(Arg::new("name").long("name").num_args(0))
+                    .arg(Arg::new("token_slot").long("token-slot").num_args(1))
+                    .arg(Arg::new("prompt").long("prompt").num_args(0)),
+                Command::new("stop")
+                    .arg(Arg::new("id").required(true))
+                    .arg(Arg::new("name").long("name").num_args(0)),
+                Command::new("create")
+                    .arg(Arg::new("name").required(true))
                     .arg(
-                        Arg::with_name("prompt")
-                            .long("--prompt")
-                            .takes_value(false)
-                            .requires("pool_uuid"),
+                        Arg::new("blockdevs")
+                            .action(ArgAction::Append)
+                            .value_parser(clap::value_parser!(PathBuf))
+                            .required(true),
+                    )
+                    .arg(
+                        Arg::new("key_descs")
+                            .long("key-descs")
+                            .num_args(1)
+                            .action(ArgAction::Append),
+                    )
+                    .arg(
+                        Arg::new("clevis_infos")
+                            .long("clevis-infos")
+                            .num_args(1)
+                            .action(ArgAction::Append),
                     ),
-                SubCommand::with_name("create")
-                    .arg(Arg::with_name("name").required(true))
-                    .arg(Arg::with_name("blockdevs").multiple(true).required(true))
+                Command::new("init-cache")
+                    .arg(Arg::new("name").required(true))
                     .arg(
-                        Arg::with_name("key_desc")
-                            .long("--key-desc")
-                            .takes_value(true),
-                    )
-                    .arg(
-                        Arg::with_name("clevis")
-                            .long("--clevis")
-                            .takes_value(true)
-                            .possible_values(&["nbde", "tang", "tpm2"])
-                            .requires_if("nbde", "tang_args")
-                            .requires_if("tang", "tang_args"),
-                    )
-                    .arg(
-                        Arg::with_name("tang_url")
-                            .long("--tang-url")
-                            .takes_value(true)
-                            .required_if("clevis", "nbde")
-                            .required_if("clevis", "tang"),
-                    )
-                    .arg(
-                        Arg::with_name("thumbprint")
-                            .long("--thumbprint")
-                            .takes_value(true),
-                    )
-                    .arg(
-                        Arg::with_name("trust_url")
-                            .long("--trust-url")
-                            .takes_value(false),
-                    )
-                    .group(
-                        ArgGroup::with_name("tang_args")
-                            .arg("thumbprint")
-                            .arg("trust_url"),
+                        Arg::new("blockdevs")
+                            .action(ArgAction::Append)
+                            .value_parser(clap::value_parser!(PathBuf))
+                            .required(true),
                     ),
-                SubCommand::with_name("init-cache")
-                    .arg(Arg::with_name("name").required(true))
-                    .arg(Arg::with_name("blockdevs").multiple(true).required(true)),
-                SubCommand::with_name("rename")
-                    .arg(Arg::with_name("current_name").required(true))
-                    .arg(Arg::with_name("new_name").required(true)),
-                SubCommand::with_name("add-data")
-                    .arg(Arg::with_name("name").required(true))
-                    .arg(Arg::with_name("blockdevs").multiple(true).required(true)),
-                SubCommand::with_name("destroy").arg(Arg::with_name("name").required(true)),
-                SubCommand::with_name("is-encrypted")
-                    .arg(Arg::with_name("pool_uuid").required(true)),
-                SubCommand::with_name("is-locked").arg(Arg::with_name("pool_uuid").required(true)),
-                SubCommand::with_name("is-bound").arg(Arg::with_name("pool_uuid").required(true)),
-                SubCommand::with_name("has-passphrase")
-                    .arg(Arg::with_name("pool_uuid").required(true)),
-                SubCommand::with_name("clevis-pin").arg(Arg::with_name("pool_uuid").required(true)),
+                Command::new("rename")
+                    .arg(Arg::new("current_name").required(true))
+                    .arg(Arg::new("new_name").required(true)),
+                Command::new("add-data")
+                    .arg(Arg::new("name").required(true))
+                    .arg(
+                        Arg::new("blockdevs")
+                            .action(ArgAction::Append)
+                            .value_parser(clap::value_parser!(PathBuf))
+                            .required(true),
+                    ),
+                Command::new("add-cache")
+                    .arg(Arg::new("name").required(true))
+                    .arg(
+                        Arg::new("blockdevs")
+                            .action(ArgAction::Append)
+                            .value_parser(clap::value_parser!(PathBuf))
+                            .required(true),
+                    ),
+                Command::new("destroy").arg(Arg::new("name").required(true)),
+                Command::new("is-encrypted")
+                    .arg(Arg::new("name").long("name").num_args(0))
+                    .arg(Arg::new("id").required(true)),
+                Command::new("is-stopped")
+                    .arg(Arg::new("name").long("name").num_args(0))
+                    .arg(Arg::new("id").required(true)),
+                Command::new("all-devices-present")
+                    .arg(Arg::new("name").long("name").num_args(0))
+                    .arg(Arg::new("id").required(true)),
+                Command::new("has-passphrase")
+                    .arg(Arg::new("name").long("name").num_args(0))
+                    .arg(Arg::new("id").required(true)),
+                Command::new("is-bound")
+                    .arg(Arg::new("name").long("name").num_args(0))
+                    .arg(Arg::new("id").required(true)),
+                Command::new("bind")
+                    .subcommand_required(true)
+                    .subcommands(vec![
+                        Command::new("keyring")
+                            .arg(Arg::new("name").long("name").num_args(0))
+                            .arg(Arg::new("id").required(true))
+                            .arg(
+                                Arg::new("key_desc")
+                                    .long("key-desc")
+                                    .num_args(1)
+                                    .required(true),
+                            )
+                            .arg(Arg::new("token_slot").long("token-slot").num_args(1)),
+                        Command::new("nbde")
+                            .alias("tang")
+                            .arg(Arg::new("name").long("name").num_args(0))
+                            .arg(Arg::new("id").required(true))
+                            .arg(Arg::new("tang_url").required(true))
+                            .arg(Arg::new("token_slot").long("token-slot").num_args(1))
+                            .arg(Arg::new("thumbprint").long("thumbprint").num_args(1))
+                            .arg(Arg::new("trust_url").long("trust-url").num_args(0))
+                            .group(
+                                ArgGroup::new("tang_args")
+                                    .arg("thumbprint")
+                                    .arg("trust_url"),
+                            ),
+                        Command::new("tpm2")
+                            .arg(Arg::new("name").long("name").num_args(0))
+                            .arg(Arg::new("id").required(true))
+                            .arg(Arg::new("token_slot").long("token-slot").num_args(1)),
+                    ]),
+                Command::new("unbind")
+                    .subcommand_required(true)
+                    .subcommands(vec![
+                        Command::new("keyring")
+                            .arg(Arg::new("name").long("name").num_args(0))
+                            .arg(Arg::new("id").required(true))
+                            .arg(
+                                Arg::new("token_slot")
+                                    .long("token-slot")
+                                    .num_args(1)
+                                    .value_parser(clap::value_parser!(u32)),
+                            ),
+                        Command::new("clevis")
+                            .arg(Arg::new("name").long("name").num_args(0))
+                            .arg(Arg::new("id").required(true))
+                            .arg(
+                                Arg::new("token_slot")
+                                    .long("token-slot")
+                                    .num_args(1)
+                                    .value_parser(clap::value_parser!(u32)),
+                            ),
+                    ]),
+                Command::new("rebind")
+                    .subcommand_required(true)
+                    .subcommands(vec![
+                        Command::new("keyring")
+                            .arg(Arg::new("name").long("name").num_args(0))
+                            .arg(Arg::new("id").required(true))
+                            .arg(
+                                Arg::new("key_desc")
+                                    .long("key-desc")
+                                    .num_args(1)
+                                    .required(true),
+                            )
+                            .arg(
+                                Arg::new("token_slot")
+                                    .long("token-slot")
+                                    .num_args(1)
+                                    .value_parser(clap::value_parser!(u32)),
+                            ),
+                        Command::new("clevis")
+                            .arg(Arg::new("name").long("name").num_args(0))
+                            .arg(Arg::new("id").required(true))
+                            .arg(
+                                Arg::new("token_slot")
+                                    .long("token-slot")
+                                    .num_args(1)
+                                    .value_parser(clap::value_parser!(u32)),
+                            ),
+                    ]),
             ]),
-            SubCommand::with_name("filesystem").subcommands(vec![
-                SubCommand::with_name("create")
-                    .arg(Arg::with_name("pool_name").required(true))
-                    .arg(Arg::with_name("fs_name").required(true)),
-                SubCommand::with_name("destroy")
-                    .arg(Arg::with_name("pool_name").required(true))
-                    .arg(Arg::with_name("fs_name").required(true)),
-                SubCommand::with_name("rename")
-                    .arg(Arg::with_name("pool_name").required(true))
-                    .arg(Arg::with_name("fs_name").required(true))
-                    .arg(Arg::with_name("new_fs_name").required(true)),
+            Command::new("filesystem").subcommands(vec![
+                Command::new("create")
+                    .arg(Arg::new("pool_name").required(true))
+                    .arg(Arg::new("fs_name").required(true))
+                    .arg(Arg::new("size").long("size").num_args(1))
+                    .arg(Arg::new("size_limit").long("size-limit").num_args(1)),
+                Command::new("destroy")
+                    .arg(Arg::new("pool_name").required(true))
+                    .arg(Arg::new("fs_name").required(true)),
+                Command::new("rename")
+                    .arg(Arg::new("pool_name").required(true))
+                    .arg(Arg::new("fs_name").required(true))
+                    .arg(Arg::new("new_fs_name").required(true)),
+                Command::new("origin")
+                    .arg(Arg::new("pool_name").required(true))
+                    .arg(Arg::new("fs_name").required(true)),
+                Command::new("set-size-limit")
+                    .arg(Arg::new("pool_name").required(true))
+                    .arg(Arg::new("fs_name").required(true))
+                    .arg(Arg::new("size_limit").num_args(1).required(true)),
             ]),
-            SubCommand::with_name("report"),
+            Command::new("report"),
         ])
 }
 
-fn get_paths_from_args<'a>(args: &'a ArgMatches<'a>) -> Vec<PathBuf> {
-    args.values_of("blockdevs")
-        .expect("required")
-        .map(PathBuf::from)
-        .collect::<Vec<_>>()
-}
+fn main() -> Result<(), String> {
+    fn main_box() -> Result<(), Box<dyn Error>> {
+        let cmd = parse_args();
 
-fn get_long_help(app: &mut App<'_, '_>) -> Result<String, Box<dyn Error>> {
-    let mut help = Vec::new();
-    app.write_long_help(&mut help)?;
-    Ok(String::from_utf8(help)?)
-}
-
-fn main() -> Result<(), Box<dyn Error>> {
-    let mut app = parse_args();
-    let long_help = get_long_help(&mut app)?;
-
-    let args = app.get_matches();
-    if let Some(subcommand) = args.subcommand_matches("key") {
-        if let Some(args) = subcommand.subcommand_matches("set") {
-            key::key_set(
-                KeyDescription::try_from(args.value_of("key_desc").expect("required").to_string())?,
-                args.value_of("keyfile_path"),
-            )?;
-            Ok(())
-        } else if let Some(args) = subcommand.subcommand_matches("unset") {
-            key::key_unset(KeyDescription::try_from(
-                args.value_of("key_desc").expect("required").to_string(),
-            )?)?;
-            Ok(())
-        } else {
-            key::key_list()?;
-            Ok(())
-        }
-    } else if let Some(subcommand) = args.subcommand_matches("pool") {
-        if let Some(args) = subcommand.subcommand_matches("unlock") {
-            let unlock_method =
-                UnlockMethod::try_from(args.value_of("unlock_method").expect("required"))?;
-            let uuid = match args.value_of("pool_uuid") {
-                Some(u) => Some(PoolUuid::parse_str(u)?),
-                None => None,
-            };
-            let prompt = args.is_present("prompt");
-            if prompt && unlock_method == UnlockMethod::Clevis {
-                return Err(Box::new(StratisError::Msg(
-                    "--prompt and an unlock_method of clevis are mutally exclusive".to_string(),
-                )));
+        let args = cmd.get_matches();
+        if let Some(subcommand) = args.subcommand_matches("key") {
+            if let Some(args) = subcommand.subcommand_matches("set") {
+                key::key_set(
+                    KeyDescription::try_from(
+                        args.get_one::<String>("key_desc").expect("required"),
+                    )?,
+                    args.get_one::<String>("keyfile_path").map(|s| s.as_str()),
+                )?;
+                Ok(())
+            } else if let Some(args) = subcommand.subcommand_matches("unset") {
+                key::key_unset(KeyDescription::try_from(
+                    args.get_one::<String>("key_desc").expect("required"),
+                )?)?;
+                Ok(())
+            } else {
+                key::key_list()?;
+                Ok(())
             }
-            pool::pool_unlock(unlock_method, uuid, prompt)?;
-            Ok(())
-        } else if let Some(args) = subcommand.subcommand_matches("create") {
-            let paths = get_paths_from_args(args);
-            let key_description = match args.value_of("key_desc").map(|s| s.to_owned()) {
-                Some(string) => Some(KeyDescription::try_from(string)?),
-                None => None,
-            };
-            let pin = args.value_of("clevis");
-            let clevis_info = match pin {
-                Some("nbde" | "tang") => {
-                    let mut json = Map::new();
-                    json.insert(
-                        "url".to_string(),
-                        Value::from(args.value_of("tang_url").expect("Required")),
-                    );
-                    if args.is_present("trust_url") {
-                        json.insert(CLEVIS_TANG_TRUST_URL.to_string(), Value::from(true));
-                    } else if let Some(thp) = args.value_of("thumbprint") {
-                        json.insert("thp".to_string(), Value::from(thp));
+        } else if let Some(subcommand) = args.subcommand_matches("pool") {
+            if let Some(args) = subcommand.subcommand_matches("start") {
+                let id = if args.get_flag("name") {
+                    PoolIdentifier::Name(Name::new(
+                        args.get_one::<String>("id").expect("required").to_owned(),
+                    ))
+                } else {
+                    PoolIdentifier::Uuid(PoolUuid::parse_str(
+                        args.get_one::<String>("id")
+                            .map(|s| s.as_str())
+                            .expect("required"),
+                    )?)
+                };
+                let token_slot = match args.get_one::<String>("token_slot").map(|s| s.as_str()) {
+                    Some("any") => TokenUnlockMethod::Any,
+                    Some(s) => TokenUnlockMethod::Token(s.parse::<u32>()?),
+                    None => TokenUnlockMethod::None,
+                };
+                let prompt = args.get_flag("prompt");
+                pool::pool_start(id, token_slot, prompt)?;
+                Ok(())
+            } else if let Some(args) = subcommand.subcommand_matches("stop") {
+                let id = if args.get_flag("name") {
+                    PoolIdentifier::Name(Name::new(
+                        args.get_one::<String>("id").expect("required").to_owned(),
+                    ))
+                } else {
+                    PoolIdentifier::Uuid(PoolUuid::parse_str(
+                        args.get_one::<String>("id")
+                            .map(|s| s.as_str())
+                            .expect("required"),
+                    )?)
+                };
+                pool::pool_stop(id)?;
+                Ok(())
+            } else if let Some(args) = subcommand.subcommand_matches("create") {
+                let kds = match args.get_many::<String>("key_descs") {
+                    Some(key_descs) => {
+                        key_descs.into_iter().try_fold(Vec::new(), |mut vec, s| {
+                            let mut split = s.split(":");
+                            let kd = split.next().ok_or_else(|| {
+                                StratisError::Msg("Key description required".to_string())
+                            })?;
+                            let token_slot = split
+                                .next()
+                                .map(|i| {
+                                    i.parse::<u32>()
+                                        .map_err(|e| StratisError::Msg(e.to_string()))
+                                })
+                                .transpose()?;
+                            vec.push((token_slot, KeyDescription::try_from(kd.to_string())?));
+                            Result::<_, StratisError>::Ok(vec)
+                        })?
                     }
-                    pin.map(|p| (p.to_string(), Value::from(json)))
+                    None => vec![],
+                };
+                let cis = match args.get_many::<String>("clevis_infos") {
+                    Some(clevis_infos) => {
+                        clevis_infos
+                            .into_iter()
+                            .try_fold(Vec::new(), |mut vec, s| {
+                                let pairs = s.split_whitespace().try_fold(
+                                    HashMap::<&str, Option<&str>>::default(),
+                                    |mut hm, pair| {
+                                        let mut key_value = pair.split("=");
+                                        match (key_value.next(), key_value.next()) {
+                                            (None, _) => {
+                                                return Err(StratisError::Msg(format!(
+                                                    "Malformed value pair: {pair}"
+                                                )));
+                                            }
+                                            (Some(k), None) => hm.insert(k, None),
+                                            (Some(k), Some(v)) => hm.insert(k, Some(v)),
+                                        };
+                                        Ok(hm)
+                                    },
+                                )?;
+                                let token_slot = if let Some(Some(t)) = pairs.get("token_slot") {
+                                    Some(
+                                        t.parse::<u32>()
+                                            .map_err(|e| StratisError::Msg(e.to_string()))?,
+                                    )
+                                } else if let Some(None) = pairs.get("token_slot") {
+                                    return Err(StratisError::Msg(
+                                        "token_slot requires argument".to_string(),
+                                    ));
+                                } else {
+                                    None
+                                };
+                                match pairs.get("pin") {
+                                    Some(Some("tang")) => {
+                                        let tang_url = if let Some(t) = pairs
+                                            .get("tang_url")
+                                            .and_then(|t| t.as_ref().map(|s| *s))
+                                        {
+                                            t
+                                        } else {
+                                            return Err(StratisError::Msg(
+                                                "tang_url is required".to_string(),
+                                            ));
+                                        };
+                                        let (thumbprint, trust_url) =
+                                            match (pairs.get("thumbprint"), pairs.get("trust_url"))
+                                            {
+                                                (Some(Some(t)), None) => (Some(*t), false),
+                                                (None, Some(None)) => (None, true),
+                                                (None, Some(Some(_))) => {
+                                                    return Err(StratisError::Msg(
+                                                        "trust_url takes no argument".to_string(),
+                                                    ));
+                                                }
+                                                (None, None) => {
+                                                    return Err(StratisError::Msg(
+                                                        "Missing required argument trust_url or thumbprint="
+                                                            .to_string(),
+                                                    ));
+                                                }
+                                                (_, _) => {
+                                                    return Err(StratisError::Msg(
+                                                        "thumbprint= cannot be used with trust_url"
+                                                            .to_string(),
+                                                    ));
+                                                }
+                                            };
+                                        let mut json = Map::new();
+                                        json.insert("url".to_string(), Value::from(tang_url));
+                                        if trust_url {
+                                            json.insert(
+                                                CLEVIS_TANG_TRUST_URL.to_string(),
+                                                Value::from(true),
+                                            );
+                                        } else if let Some(thp) = thumbprint {
+                                            json.insert("thp".to_string(), Value::from(thp));
+                                        }
+                                        vec.push((
+                                            token_slot,
+                                            ("tang".to_string(), Value::from(json)),
+                                        ));
+                                        Ok(vec)
+                                    }
+                                    Some(Some("tpm2")) => {
+                                        vec.push((token_slot, ("tpm2".to_string(), json!({}))));
+                                        Ok(vec)
+                                    }
+                                    Some(Some(s)) => {
+                                        Err(StratisError::Msg(format!("Invalid pin {s}")))
+                                    }
+                                    Some(None) => Err(StratisError::Msg(
+                                        "Value required for key pin".to_string(),
+                                    )),
+                                    None => Err(StratisError::Msg("pin is required".to_string())),
+                                }
+                            })?
+                    }
+                    None => vec![],
+                };
+                let ei = InputEncryptionInfo::new(kds, cis)?;
+                pool::pool_create(
+                    args.get_one::<String>("name").expect("required").to_owned(),
+                    args.get_many::<PathBuf>("blockdevs")
+                        .expect("required")
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    ei,
+                )?;
+                Ok(())
+            } else if let Some(args) = subcommand.subcommand_matches("destroy") {
+                pool::pool_destroy(args.get_one::<String>("name").expect("required").to_owned())?;
+                Ok(())
+            } else if let Some(args) = subcommand.subcommand_matches("init-cache") {
+                pool::pool_init_cache(
+                    args.get_one::<String>("name").expect("required").to_owned(),
+                    args.get_many::<PathBuf>("blockdevs")
+                        .expect("required")
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )?;
+                Ok(())
+            } else if let Some(args) = subcommand.subcommand_matches("rename") {
+                pool::pool_rename(
+                    args.get_one::<String>("current_name")
+                        .expect("required")
+                        .to_owned(),
+                    args.get_one::<String>("new_name")
+                        .expect("required")
+                        .to_owned(),
+                )?;
+                Ok(())
+            } else if let Some(args) = subcommand.subcommand_matches("add-data") {
+                pool::pool_add_data(
+                    args.get_one::<String>("name").expect("required").to_owned(),
+                    args.get_many::<PathBuf>("blockdevs")
+                        .expect("required")
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )?;
+                Ok(())
+            } else if let Some(args) = subcommand.subcommand_matches("add-cache") {
+                pool::pool_add_cache(
+                    args.get_one::<String>("name").expect("required").to_owned(),
+                    args.get_many::<PathBuf>("blockdevs")
+                        .expect("required")
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )?;
+                Ok(())
+            } else if let Some(args) = subcommand.subcommand_matches("is-encrypted") {
+                let id = if args.get_flag("name") {
+                    PoolIdentifier::Name(Name::new(
+                        args.get_one::<String>("id").expect("required").to_owned(),
+                    ))
+                } else {
+                    PoolIdentifier::Uuid(PoolUuid::parse_str(
+                        args.get_one::<String>("id")
+                            .map(|s| s.as_str())
+                            .expect("required"),
+                    )?)
+                };
+                println!("{}", pool::pool_is_encrypted(id)?);
+                Ok(())
+            } else if let Some(args) = subcommand.subcommand_matches("is-stopped") {
+                let id = if args.get_flag("name") {
+                    PoolIdentifier::Name(Name::new(
+                        args.get_one::<String>("id").expect("required").to_owned(),
+                    ))
+                } else {
+                    PoolIdentifier::Uuid(PoolUuid::parse_str(
+                        args.get_one::<String>("id")
+                            .map(|s| s.as_str())
+                            .expect("required"),
+                    )?)
+                };
+                println!("{}", pool::pool_is_stopped(id)?);
+                Ok(())
+            } else if let Some(args) = subcommand.subcommand_matches("all-devices-present") {
+                let id = if args.get_flag("name") {
+                    PoolIdentifier::Name(Name::new(
+                        args.get_one::<String>("id").expect("required").to_owned(),
+                    ))
+                } else {
+                    PoolIdentifier::Uuid(PoolUuid::parse_str(
+                        args.get_one::<String>("id")
+                            .map(|s| s.as_str())
+                            .expect("required"),
+                    )?)
+                };
+                println!("{}", pool::pool_all_devices_present(id)?);
+                Ok(())
+            } else if let Some(args) = subcommand.subcommand_matches("has-passphrase") {
+                let id = if args.get_flag("name") {
+                    PoolIdentifier::Name(Name::new(
+                        args.get_one::<String>("id").expect("required").to_owned(),
+                    ))
+                } else {
+                    PoolIdentifier::Uuid(PoolUuid::parse_str(
+                        args.get_one::<String>("id")
+                            .map(|s| s.as_str())
+                            .expect("required"),
+                    )?)
+                };
+                println!("{}", pool::pool_has_passphrase(id)?);
+                Ok(())
+            } else if let Some(args) = subcommand.subcommand_matches("is-bound") {
+                let id = if args.get_flag("name") {
+                    PoolIdentifier::Name(Name::new(
+                        args.get_one::<String>("id").expect("required").to_owned(),
+                    ))
+                } else {
+                    PoolIdentifier::Uuid(PoolUuid::parse_str(
+                        args.get_one::<String>("id")
+                            .map(|s| s.as_str())
+                            .expect("required"),
+                    )?)
+                };
+                println!("{}", pool::pool_is_bound(id)?);
+                Ok(())
+            } else if let Some(subcommand) = subcommand.subcommand_matches("bind") {
+                if let Some(args) = subcommand.subcommand_matches("keyring") {
+                    let id = if args.get_flag("name") {
+                        PoolIdentifier::Name(Name::new(
+                            args.get_one::<String>("id").expect("required").to_owned(),
+                        ))
+                    } else {
+                        PoolIdentifier::Uuid(PoolUuid::parse_str(
+                            args.get_one::<String>("id")
+                                .map(|s| s.as_str())
+                                .expect("required"),
+                        )?)
+                    };
+                    let key_desc = KeyDescription::try_from(
+                        args.get_one::<String>("key_desc").expect("required"),
+                    )?;
+                    let token_slot = match args.get_one::<String>("token_slot").map(|s| s.as_str())
+                    {
+                        Some("legacy") => OptionalTokenSlotInput::Legacy,
+                        Some(s) => OptionalTokenSlotInput::Some(s.parse::<u32>()?),
+                        None => OptionalTokenSlotInput::None,
+                    };
+                    pool::pool_bind_keyring(id, token_slot, key_desc)?;
+                    Ok(())
+                } else if let Some(args) = subcommand.subcommand_matches("nbde") {
+                    let id = if args.get_flag("name") {
+                        PoolIdentifier::Name(Name::new(
+                            args.get_one::<String>("id").expect("required").to_owned(),
+                        ))
+                    } else {
+                        PoolIdentifier::Uuid(PoolUuid::parse_str(
+                            args.get_one::<String>("id")
+                                .map(|s| s.as_str())
+                                .expect("required"),
+                        )?)
+                    };
+                    let clevis_info = {
+                        let mut json = Map::new();
+                        json.insert(
+                            "url".to_string(),
+                            Value::from(
+                                args.get_one::<String>("tang_url")
+                                    .map(|s| s.as_str())
+                                    .expect("Required"),
+                            ),
+                        );
+                        if args.get_flag("trust_url") {
+                            json.insert(CLEVIS_TANG_TRUST_URL.to_string(), Value::from(true));
+                        } else if let Some(thp) =
+                            args.get_one::<String>("thumbprint").map(|s| s.as_str())
+                        {
+                            json.insert("thp".to_string(), Value::from(thp));
+                        }
+                        Value::from(json)
+                    };
+                    let token_slot = match args.get_one::<String>("token_slot").map(|s| s.as_str())
+                    {
+                        Some("legacy") => OptionalTokenSlotInput::Legacy,
+                        Some(s) => OptionalTokenSlotInput::Some(s.parse::<u32>()?),
+                        None => OptionalTokenSlotInput::None,
+                    };
+                    pool::pool_bind_clevis(id, token_slot, "tang".to_string(), clevis_info)?;
+                    Ok(())
+                } else if let Some(args) = subcommand.subcommand_matches("tpm2") {
+                    let id = if args.get_flag("name") {
+                        PoolIdentifier::Name(Name::new(
+                            args.get_one::<String>("id").expect("required").to_owned(),
+                        ))
+                    } else {
+                        PoolIdentifier::Uuid(PoolUuid::parse_str(
+                            args.get_one::<String>("id")
+                                .map(|s| s.as_str())
+                                .expect("required"),
+                        )?)
+                    };
+                    let pin = "tpm2";
+                    let clevis_info = {
+                        let json = Map::new();
+                        Value::from(json)
+                    };
+                    let token_slot = match args.get_one::<String>("token_slot").map(|s| s.as_str())
+                    {
+                        Some("legacy") => OptionalTokenSlotInput::Legacy,
+                        Some(s) => OptionalTokenSlotInput::Some(s.parse::<u32>()?),
+                        None => OptionalTokenSlotInput::None,
+                    };
+                    pool::pool_bind_clevis(id, token_slot, pin.to_string(), clevis_info)?;
+                    Ok(())
+                } else {
+                    unreachable!("Parser requires a subcommand")
                 }
-                Some("tpm2") => Some(("tpm2".to_string(), json!({}))),
-                Some(_) => unreachable!("Validated by parser"),
-                None => None,
-            };
-            pool::pool_create(
-                args.value_of("name").expect("required").to_string(),
-                paths,
-                EncryptionInfo::from_options((key_description, clevis_info)),
-            )?;
-            Ok(())
-        } else if let Some(args) = subcommand.subcommand_matches("destroy") {
-            pool::pool_destroy(args.value_of("name").expect("required").to_string())?;
-            Ok(())
-        } else if let Some(args) = subcommand.subcommand_matches("init-cache") {
-            let paths = get_paths_from_args(args);
-            pool::pool_init_cache(args.value_of("name").expect("required").to_string(), paths)?;
-            Ok(())
-        } else if let Some(args) = subcommand.subcommand_matches("rename") {
-            pool::pool_rename(
-                args.value_of("current_name").expect("required").to_string(),
-                args.value_of("new_name").expect("required").to_string(),
-            )?;
-            Ok(())
-        } else if let Some(args) = subcommand.subcommand_matches("add-data") {
-            let paths = get_paths_from_args(args);
-            pool::pool_add_data(args.value_of("name").expect("required").to_string(), paths)?;
-            Ok(())
-        } else if let Some(args) = subcommand.subcommand_matches("add-cache") {
-            let paths = get_paths_from_args(args);
-            pool::pool_add_cache(args.value_of("name").expect("required").to_string(), paths)?;
-            Ok(())
-        } else if let Some(args) = subcommand.subcommand_matches("is-encrypted") {
-            let uuid_str = args.value_of("pool_uuid").expect("required");
-            let uuid = PoolUuid::parse_str(uuid_str)?;
-            println!("{}", pool::pool_is_encrypted(uuid)?,);
-            Ok(())
-        } else if let Some(args) = subcommand.subcommand_matches("is-locked") {
-            let uuid_str = args.value_of("pool_uuid").expect("required");
-            let uuid = PoolUuid::parse_str(uuid_str)?;
-            println!("{}", pool::pool_is_locked(uuid)?,);
-            Ok(())
-        } else if let Some(args) = subcommand.subcommand_matches("is-bound") {
-            let uuid_str = args.value_of("pool_uuid").expect("required");
-            let uuid = PoolUuid::parse_str(uuid_str)?;
-            println!("{}", pool::pool_is_bound(uuid)?,);
-            Ok(())
-        } else if let Some(args) = subcommand.subcommand_matches("has-passphrase") {
-            let uuid_str = args.value_of("pool_uuid").expect("required");
-            let uuid = PoolUuid::parse_str(uuid_str)?;
-            println!("{}", pool::pool_has_passphrase(uuid)?,);
-            Ok(())
-        } else if let Some(args) = subcommand.subcommand_matches("clevis-pin") {
-            let uuid_str = args.value_of("pool_uuid").expect("required");
-            let uuid = PoolUuid::parse_str(uuid_str)?;
-            println!("{}", pool::pool_clevis_pin(uuid)?,);
+            } else if let Some(subcommand) = subcommand.subcommand_matches("unbind") {
+                if let Some(args) = subcommand.subcommand_matches("keyring") {
+                    let id = if args.get_flag("name") {
+                        PoolIdentifier::Name(Name::new(
+                            args.get_one::<String>("id").expect("required").to_owned(),
+                        ))
+                    } else {
+                        PoolIdentifier::Uuid(PoolUuid::parse_str(
+                            args.get_one::<String>("id")
+                                .map(|s| s.as_str())
+                                .expect("required"),
+                        )?)
+                    };
+                    let token_slot = args.get_one::<u32>("token_slot").cloned();
+                    pool::pool_unbind_keyring(id, token_slot)?;
+                    Ok(())
+                } else if let Some(args) = subcommand.subcommand_matches("clevis") {
+                    let id = if args.get_flag("name") {
+                        PoolIdentifier::Name(Name::new(
+                            args.get_one::<String>("id").expect("required").to_owned(),
+                        ))
+                    } else {
+                        PoolIdentifier::Uuid(PoolUuid::parse_str(
+                            args.get_one::<String>("id")
+                                .map(|s| s.as_str())
+                                .expect("required"),
+                        )?)
+                    };
+                    let token_slot = args.get_one::<u32>("token_slot").cloned();
+                    pool::pool_unbind_clevis(id, token_slot)?;
+                    Ok(())
+                } else {
+                    unreachable!("Parser requires a subcommand")
+                }
+            } else if let Some(subcommand) = subcommand.subcommand_matches("rebind") {
+                if let Some(args) = subcommand.subcommand_matches("keyring") {
+                    let id = if args.get_flag("name") {
+                        PoolIdentifier::Name(Name::new(
+                            args.get_one::<String>("id").expect("required").to_owned(),
+                        ))
+                    } else {
+                        PoolIdentifier::Uuid(PoolUuid::parse_str(
+                            args.get_one::<String>("id")
+                                .map(|s| s.as_str())
+                                .expect("required"),
+                        )?)
+                    };
+                    let key_desc = KeyDescription::try_from(
+                        args.get_one::<String>("key_desc").expect("required"),
+                    )?;
+                    let token_slot = args.get_one::<u32>("token_slot").cloned();
+                    pool::pool_rebind_keyring(id, token_slot, key_desc)?;
+                    Ok(())
+                } else if let Some(args) = subcommand.subcommand_matches("clevis") {
+                    let id = if args.get_flag("name") {
+                        PoolIdentifier::Name(Name::new(
+                            args.get_one::<String>("id").expect("required").to_owned(),
+                        ))
+                    } else {
+                        PoolIdentifier::Uuid(PoolUuid::parse_str(
+                            args.get_one::<String>("id")
+                                .map(|s| s.as_str())
+                                .expect("required"),
+                        )?)
+                    };
+                    let token_slot = args.get_one::<u32>("token_slot").cloned();
+                    pool::pool_rebind_clevis(id, token_slot)?;
+                    Ok(())
+                } else {
+                    unreachable!("Parser requires a subcommand")
+                }
+            } else {
+                pool::pool_list()?;
+                Ok(())
+            }
+        } else if let Some(subcommand) = args.subcommand_matches("filesystem") {
+            if let Some(args) = subcommand.subcommand_matches("create") {
+                let size = args
+                    .get_one::<String>("size")
+                    .map(|s| parse_size(s))
+                    .transpose()?;
+                let size_limit = args
+                    .get_one::<String>("size_limit")
+                    .map(|s| parse_size(s))
+                    .transpose()?;
+                filesystem::filesystem_create(
+                    args.get_one::<String>("pool_name")
+                        .expect("required")
+                        .to_owned(),
+                    args.get_one::<String>("fs_name")
+                        .expect("required")
+                        .to_owned(),
+                    size,
+                    size_limit,
+                )?;
+                Ok(())
+            } else if let Some(args) = subcommand.subcommand_matches("destroy") {
+                filesystem::filesystem_destroy(
+                    args.get_one::<String>("pool_name")
+                        .expect("required")
+                        .to_owned(),
+                    args.get_one::<String>("fs_name")
+                        .expect("required")
+                        .to_owned(),
+                )?;
+                Ok(())
+            } else if let Some(args) = subcommand.subcommand_matches("rename") {
+                filesystem::filesystem_rename(
+                    args.get_one::<String>("pool_name")
+                        .expect("required")
+                        .to_owned(),
+                    args.get_one::<String>("fs_name")
+                        .expect("required")
+                        .to_owned(),
+                    args.get_one::<String>("new_fs_name")
+                        .expect("required")
+                        .to_owned(),
+                )?;
+                Ok(())
+            } else if let Some(args) = subcommand.subcommand_matches("origin") {
+                filesystem::filesystem_origin(
+                    args.get_one::<String>("pool_name")
+                        .expect("required")
+                        .to_owned(),
+                    args.get_one::<String>("fs_name")
+                        .expect("required")
+                        .to_owned(),
+                )
+                .map(|origin| {
+                    println!("{origin}");
+                })?;
+                Ok(())
+            } else if let Some(args) = subcommand.subcommand_matches("set-size-limit") {
+                let size_limit = args
+                    .get_one::<String>("size_limit")
+                    .map(|s| parse_size(s))
+                    .transpose()?;
+                filesystem::filesystem_set_size_limit(
+                    args.get_one::<String>("pool_name")
+                        .expect("required")
+                        .to_owned(),
+                    args.get_one::<String>("fs_name")
+                        .expect("required")
+                        .to_owned(),
+                    size_limit.expect("required"),
+                )?;
+                Ok(())
+            } else {
+                filesystem::filesystem_list()?;
+                Ok(())
+            }
+        } else if let Some("report") = args.subcommand_name() {
+            report::report().and_then(|j| {
+                println!("{}", serde_json::to_string_pretty(&j)?);
+                Ok(())
+            })?;
             Ok(())
         } else {
-            pool::pool_list()?;
-            Ok(())
+            unreachable!("Parser requires a subcommand.")
         }
-    } else if let Some(subcommand) = args.subcommand_matches("filesystem") {
-        if let Some(args) = subcommand.subcommand_matches("create") {
-            filesystem::filesystem_create(
-                args.value_of("pool_name").expect("required").to_string(),
-                args.value_of("fs_name").expect("required").to_string(),
-            )?;
-            Ok(())
-        } else if let Some(args) = subcommand.subcommand_matches("destroy") {
-            filesystem::filesystem_destroy(
-                args.value_of("pool_name").expect("required").to_string(),
-                args.value_of("fs_name").expect("required").to_string(),
-            )?;
-            Ok(())
-        } else if let Some(args) = subcommand.subcommand_matches("rename") {
-            filesystem::filesystem_rename(
-                args.value_of("pool_name").expect("required").to_string(),
-                args.value_of("fs_name").expect("required").to_string(),
-                args.value_of("new_fs_name").expect("required").to_string(),
-            )?;
-            Ok(())
-        } else {
-            filesystem::filesystem_list()?;
-            Ok(())
-        }
-    } else if let Some("report") = args.subcommand_name() {
-        report::report().and_then(|j| {
-            println!("{}", serde_json::to_string_pretty(&j)?);
-            Ok(())
-        })?;
-        Ok(())
-    } else {
-        println!("{}", long_help);
-        Ok(())
+    }
+
+    main_box().map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod test {
+    use super::{parse_args, parse_size};
+
+    #[test]
+    fn test_stratis_min_parse_args() {
+        parse_args().debug_assert();
+    }
+
+    #[test]
+    fn test_parse_size_all_units() {
+        assert_eq!(parse_size("1B"), Ok(1));
+        assert_eq!(parse_size("1KiB"), Ok(1024));
+        assert_eq!(parse_size("1MiB"), Ok(1024 * 1024));
+        assert_eq!(parse_size("1GiB"), Ok(1024 * 1024 * 1024));
+        assert_eq!(parse_size("1TiB"), Ok(1024u128.pow(4)));
+        assert_eq!(parse_size("1PiB"), Ok(1024u128.pow(5)));
+    }
+
+    #[test]
+    fn test_parse_size_exact_byte_values() {
+        assert_eq!(parse_size("5GiB"), Ok(5 * 1024 * 1024 * 1024));
+        assert_eq!(parse_size("10MiB"), Ok(10 * 1024 * 1024));
+        assert_eq!(parse_size("512KiB"), Ok(512 * 1024));
+    }
+
+    #[test]
+    fn test_parse_size_u128_max_bytes() {
+        let s = format!("{}B", u128::MAX);
+        assert_eq!(parse_size(&s), Ok(u128::MAX));
+    }
+
+    #[test]
+    fn test_parse_size_multiplication_overflow() {
+        let pib = 1024u128.pow(5);
+        let max_magnitude = u128::MAX / pib;
+        assert!(parse_size(&format!("{max_magnitude}PiB")).is_ok());
+        assert_eq!(
+            parse_size(&format!("{}PiB", max_magnitude + 1)),
+            Err("Ill-formed size: byte count exceeds u128::MAX".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_size_invalid_unit() {
+        assert!(parse_size("1GB").is_err());
+        assert!(parse_size("1gib").is_err());
+        assert!(parse_size("1mb").is_err());
+    }
+
+    #[test]
+    fn test_parse_size_fractional() {
+        assert!(parse_size("1.5GiB").is_err());
+    }
+
+    #[test]
+    fn test_parse_size_missing_unit() {
+        assert!(parse_size("1024").is_err());
+    }
+
+    #[test]
+    fn test_parse_size_empty_magnitude() {
+        assert_eq!(
+            parse_size("GiB"),
+            Err("Ill-formed size: magnitude must be a decimal integer".to_string())
+        );
     }
 }

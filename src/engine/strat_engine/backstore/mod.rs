@@ -3,24 +3,22 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 #[allow(clippy::module_inception)]
-mod backstore;
-mod blockdev;
+pub mod backstore;
+pub mod blockdev;
 mod blockdevmgr;
 mod cache_tier;
-mod crypt;
 mod data_tier;
 mod devices;
 mod range_alloc;
 mod shared;
 
 pub use self::{
-    backstore::Backstore,
-    blockdev::{StratBlockDev, UnderlyingDevice},
-    crypt::{
-        crypt_metadata_size, CryptActivationHandle, CryptHandle, CryptMetadataHandle,
-        CLEVIS_TANG_TRUST_URL,
+    blockdev::v2::integrity_meta_space,
+    devices::{
+        find_stratis_devs_by_uuid, get_devno_from_path, get_logical_sector_size,
+        ProcessedPathInfos, UnownedDevices,
     },
 };
 
 #[cfg(test)]
-pub use self::devices::{initialize_devices, process_and_verify_devices};
+pub use self::devices::{initialize_devices, initialize_devices_legacy};

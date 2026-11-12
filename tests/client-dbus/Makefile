@@ -2,22 +2,30 @@ UNITTEST_OPTS = --verbose
 
 .PHONY: lint
 lint:
-	pylint src/stratisd_client_dbus --ignore=_introspect.py
-	pylint tests --disable=R0801
+	ruff check
+	pyright
 
-.PHONY: misc-tests
-misc-tests:
-	python3 -m unittest ${UNITTEST_OPTS} tests.misc.test_startup
+.PHONY: startup-tests
+startup-tests:
+	python3 -m unittest ${UNITTEST_OPTS} tests.udev.test_startup
+
+.PHONY: start-tests
+start-tests:
+	python3 -m unittest ${UNITTEST_OPTS} tests.udev.test_start
+
+.PHONY: extend-tests
+extend-tests:
+	python3 -m unittest ${UNITTEST_OPTS} tests.udev.test_extend
 
 .PHONY: fmt
 fmt:
-	isort src tests
-	black .
+	ruff check --fix --select I
+	ruff format
 
-.PHONY: fmt-travis
-fmt-travis:
-	isort --diff --check-only src tests
-	black . --check
+.PHONY: fmt-ci
+fmt-ci:
+	ruff check --select I
+	ruff format --check
 
 .PHONY: tang-tests
 tang-tests:
@@ -26,7 +34,19 @@ tang-tests:
 .PHONY: udev-tests
 udev-tests:
 	python3 -m unittest ${UNITTEST_OPTS} tests.udev.test_udev
+
+.PHONY: predict-tests
+predict-tests:
 	python3 -m unittest ${UNITTEST_OPTS} tests.udev.test_predict
 
-.PHONY: tests
-tests: udev-tests misc-tests
+.PHONY: filesystem-predict-tests
+filesystem-predict-tests:
+	python3 -m unittest ${UNITTEST_OPTS} tests.misc.test_predict
+
+.PHONY: dump-metadata-tests
+dump-metadata-tests:
+	python3 -m unittest ${UNITTEST_OPTS} tests.udev.test_dump
+
+.PHONY: revert-tests
+revert-tests:
+	python3 -m unittest ${UNITTEST_OPTS} tests.udev.test_revert

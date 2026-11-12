@@ -6,15 +6,15 @@
 //! pool, filesystem, or blockdev. Each action type is designed to support
 //! idempotency. In every case, the action type is used to indicate the
 //! effect of the action at the time the action is requested. The action was
-//! completed succesfully; this type indicates what changes had to be made.
+//! completed successfully; this type indicates what changes had to be made.
 
-use std::fmt::{self, Display};
+use std::fmt::{self, Debug, Display};
 
 use devicemapper::Sectors;
 
 use crate::engine::{
     engine::Filesystem,
-    types::{DevUuid, FilesystemUuid, PoolUuid},
+    types::{DevUuid, FilesystemUuid, Name, PoolUuid},
 };
 
 /// Return value indicating key operation
@@ -22,6 +22,9 @@ pub struct Key;
 
 /// Return value indicating clevis operation
 pub struct Clevis;
+
+/// Return value indicating an encrypt operation on the pool
+pub struct EncryptedDevice(pub PoolUuid);
 
 /// A trait for a generic kind of action. Defines the type of the thing to
 /// be changed, and also a method to indicate what changed.
@@ -63,7 +66,7 @@ impl Display for CreateAction<PoolUuid> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CreateAction::Created(uuid) => {
-                write!(f, "Pool with UUID {} was created successfully", uuid)
+                write!(f, "Pool with UUID {uuid} was created successfully")
             }
             CreateAction::Identity => {
                 write!(
@@ -75,13 +78,13 @@ impl Display for CreateAction<PoolUuid> {
     }
 }
 
-impl Display for CreateAction<Clevis> {
+impl Display for CreateAction<(Clevis, u32)> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CreateAction::Created(Clevis) => {
+            CreateAction::Created((_, t)) => {
                 write!(
                     f,
-                    "Pool successfully bound to an unlocking mechanism using clevis"
+                    "Pool successfully bound an unlocking mechanism to token slot {t} using clevis"
                 )
             }
             CreateAction::Identity => {
@@ -94,13 +97,13 @@ impl Display for CreateAction<Clevis> {
     }
 }
 
-impl Display for CreateAction<Key> {
+impl Display for CreateAction<(Key, u32)> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CreateAction::Created(Key) => {
+            CreateAction::Created((_, t)) => {
                 write!(
                     f,
-                    "Pool successfully bound to a passphrase in the kernel keyring"
+                    "Pool successfully bound to a passphrase to token slot {t} in the kernel keyring"
                 )
             }
             CreateAction::Identity => {
@@ -115,7 +118,7 @@ impl Display for CreateAction<Key> {
 
 impl<F> Display for CreateAction<(FilesystemUuid, &mut F)>
 where
-    F: Filesystem,
+    F: Filesystem + ?Sized,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -132,6 +135,22 @@ where
                     f,
                     "The snapshot requested for creation is already present; no action taken"
                 )
+            }
+        }
+    }
+}
+
+impl Display for CreateAction<EncryptedDevice> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CreateAction::Created(EncryptedDevice(uuid)) => {
+                write!(
+                    f,
+                    "Unencrypted pool with UUID {uuid} successfully encrypted"
+                )
+            }
+            CreateAction::Identity => {
+                write!(f, "The requested pool was already encrypted")
             }
         }
     }
@@ -221,64 +240,87 @@ impl Display for MappingDeleteAction<Key> {
     }
 }
 
-/// A type for the return type of idempotent unlocking actions.
-pub struct SetUnlockAction<T> {
-    unlocked: Vec<T>,
+/// A type for the return type of idempotent unlocking actions on an
+/// individual pool.
+pub enum SetUnlockAction<T> {
+    /// If the pool was already started.
+    Identity,
+    /// If the unlock action resulted in the pool being started.
+    Started(Vec<T>),
 }
 
 impl<T> SetUnlockAction<T> {
-    /// Create a new return type with newly unlocked resources and resources that
-    /// are still locked.
+    /// Create a new SetUnlockAction where the pool is started.
     pub fn new(unlocked: Vec<T>) -> SetUnlockAction<T> {
-        SetUnlockAction { unlocked }
+        SetUnlockAction::Started(unlocked)
     }
 
-    /// Create a new return type where no newly unlocked resources are reported.
+    /// Create a new SetUnlockAction when no newly unlocked resources are
+    /// reported but a pool is started as a consequence.
     pub fn empty() -> SetUnlockAction<T> {
-        SetUnlockAction {
-            unlocked: Vec::new(),
-        }
+        SetUnlockAction::Started(Vec::new())
+    }
+
+    ///  Create a new SetUnlockAction where the pool was already set up.
+    pub fn identity() -> SetUnlockAction<T> {
+        SetUnlockAction::Identity
     }
 }
 
 impl<T> EngineAction for SetUnlockAction<T> {
     type Return = Vec<T>;
 
+    /// true if a thing was unlocked.
     fn is_changed(&self) -> bool {
-        !self.unlocked.is_empty()
+        match self {
+            SetUnlockAction::Identity => false,
+            SetUnlockAction::Started(unlocked) => !unlocked.is_empty(),
+        }
     }
 
     fn changed(self) -> Option<Vec<T>> {
-        if self.unlocked.is_empty() {
-            None
-        } else {
-            Some(self.unlocked)
+        match self {
+            SetUnlockAction::Identity => None,
+            SetUnlockAction::Started(unlocked) => {
+                if unlocked.is_empty() {
+                    None
+                } else {
+                    Some(unlocked)
+                }
+            }
         }
     }
 }
 
 impl Display for SetUnlockAction<DevUuid> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.unlocked.is_empty() {
-            write!(
-                f,
-                "No new devices were able to be unlocked; no action was taken"
-            )
-        } else {
-            write!(
-                f,
-                "The devices with UUIDs {} were successfully unlocked",
-                self.unlocked
-                    .iter()
-                    .map(|uuid| uuid.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
+        match self {
+            SetUnlockAction::Identity => {
+                write!(f, "The pool was already set up; no action was taken")
+            }
+            SetUnlockAction::Started(unlocked) => {
+                if unlocked.is_empty() {
+                    write!(
+                        f,
+                        "No new devices were able to be unlocked; no action was taken"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "The devices with UUIDs {} were successfully unlocked",
+                        unlocked
+                            .iter()
+                            .map(|uuid| uuid.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            }
         }
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 /// An action which may create multiple things.
 pub struct SetCreateAction<T> {
     changed: Vec<T>,
@@ -310,7 +352,7 @@ impl<T> EngineAction for SetCreateAction<T> {
     }
 }
 
-impl Display for SetCreateAction<(&str, FilesystemUuid, Sectors)> {
+impl Display for SetCreateAction<(Name, FilesystemUuid, Sectors)> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.changed.is_empty() {
             write!(
@@ -323,7 +365,7 @@ impl Display for SetCreateAction<(&str, FilesystemUuid, Sectors)> {
                 "The following filesystems {} were successfully created",
                 self.changed
                     .iter()
-                    .map(|(n, u, s)| format!("name: {}, UUID: {}, size: {}", n, u, s))
+                    .map(|(n, u, s)| format!("name: {n}, UUID: {u}, size: {s}"))
                     .collect::<Vec<_>>()
                     .join("; ")
             )
@@ -336,7 +378,7 @@ impl Display for SetCreateAction<DevUuid> {
         if self.changed.is_empty() {
             write!(
                 f,
-                "The requested filesystems already exist; no action taken"
+                "The specified devices already belong to the pool; no action taken"
             )
         } else {
             write!(
@@ -388,7 +430,7 @@ impl Display for RenameAction<DevUuid> {
                 )
             }
             RenameAction::Renamed(uuid) => {
-                write!(f, "Device with UUID {} was successfully renamed", uuid)
+                write!(f, "Device with UUID {uuid} was successfully renamed")
             }
             RenameAction::NoSource => {
                 write!(f, "The device requested to be renamed does not exist")
@@ -407,7 +449,7 @@ impl Display for RenameAction<FilesystemUuid> {
                 )
             }
             RenameAction::Renamed(uuid) => {
-                write!(f, "Filesystem with UUID {} was successfully renamed", uuid)
+                write!(f, "Filesystem with UUID {uuid} was successfully renamed")
             }
             RenameAction::NoSource => {
                 write!(f, "The filesystem requested to be renamed does not exist")
@@ -423,7 +465,7 @@ impl Display for RenameAction<PoolUuid> {
                 write!(f, "Pool is already named the target name; no action taken")
             }
             RenameAction::Renamed(uuid) => {
-                write!(f, "Pool with UUID {} was successfully renamed", uuid)
+                write!(f, "Pool with UUID {uuid} was successfully renamed")
             }
             RenameAction::NoSource => {
                 write!(f, "The pool requested to be renamed does not exist")
@@ -504,7 +546,7 @@ impl Display for DeleteAction<PoolUuid> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DeleteAction::Deleted(uuid) => {
-                write!(f, "Pool with UUID {} was deleted successfully", uuid)
+                write!(f, "Pool with UUID {uuid} was deleted successfully")
             }
             DeleteAction::Identity => {
                 write!(
@@ -551,39 +593,58 @@ impl Display for DeleteAction<Key> {
     }
 }
 
-/// An action which may create multiple things.
-#[derive(Debug, PartialEq, Eq)]
-pub struct SetDeleteAction<T> {
-    changed: Vec<T>,
+impl Display for DeleteAction<EncryptedDevice> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DeleteAction::Deleted(EncryptedDevice(uuid)) => {
+                write!(f, "Encrypted pool with UUID {uuid} successfully decrypted")
+            }
+            DeleteAction::Identity => {
+                write!(f, "The requested pool was already decrypted")
+            }
+        }
+    }
 }
 
-impl<T> SetDeleteAction<T> {
-    pub fn new(changed: Vec<T>) -> Self {
-        SetDeleteAction { changed }
+/// An action which may delete multiple things.
+/// This action may also cause other values to require updating.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SetDeleteAction<T, U> {
+    changed: Vec<T>,
+    updated: Vec<U>,
+}
+
+impl<T, U> SetDeleteAction<T, U> {
+    pub fn new(changed: Vec<T>, updated: Vec<U>) -> Self {
+        assert!(!changed.is_empty() || updated.is_empty());
+        SetDeleteAction { changed, updated }
     }
 
     pub fn empty() -> Self {
-        SetDeleteAction { changed: vec![] }
+        SetDeleteAction {
+            changed: vec![],
+            updated: vec![],
+        }
     }
 }
 
-impl<T> EngineAction for SetDeleteAction<T> {
-    type Return = Vec<T>;
+impl<T, U> EngineAction for SetDeleteAction<T, U> {
+    type Return = (Vec<T>, Vec<U>);
 
     fn is_changed(&self) -> bool {
         !self.changed.is_empty()
     }
 
-    fn changed(self) -> Option<Vec<T>> {
+    fn changed(self) -> Option<(Vec<T>, Vec<U>)> {
         if self.changed.is_empty() {
             None
         } else {
-            Some(self.changed)
+            Some((self.changed, self.updated))
         }
     }
 }
 
-impl Display for SetDeleteAction<FilesystemUuid> {
+impl Display for SetDeleteAction<FilesystemUuid, (FilesystemUuid, Option<FilesystemUuid>)> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.changed.is_empty() {
             write!(
@@ -604,6 +665,24 @@ impl Display for SetDeleteAction<FilesystemUuid> {
     }
 }
 
+impl Display for SetDeleteAction<DevUuid, ()> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.changed.is_empty() {
+            write!(f, "No cache devices to remove; no action taken")
+        } else {
+            write!(
+                f,
+                "Cache devices with UUIDs {} were successfully removed",
+                self.changed
+                    .iter()
+                    .map(|u| u.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    }
+}
+
 /// Action indicating a Clevis binding regeneration
 pub struct RegenAction;
 
@@ -612,6 +691,209 @@ impl Display for RegenAction {
         write!(
             f,
             "The Clevis bindings were successfully regenerated using the same configuration that was originally supplied"
+        )
+    }
+}
+
+/// Action indicating an operation for starting a resource
+pub enum StartAction<T> {
+    Identity,
+    Started(T),
+}
+
+impl Display for StartAction<PoolUuid> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StartAction::Identity => write!(
+                f,
+                "The requested pool is already started; no action was taken"
+            ),
+            StartAction::Started(uuid) => {
+                write!(f, "The pool with UUID {uuid} was successfully started")
+            }
+        }
+    }
+}
+
+impl<T> EngineAction for StartAction<T> {
+    type Return = T;
+
+    fn is_changed(&self) -> bool {
+        matches!(self, StartAction::Started(_))
+    }
+
+    fn changed(self) -> Option<Self::Return> {
+        match self {
+            StartAction::Started(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// Action indicating an operation for stopped a resource
+pub enum StopAction<T> {
+    /// Was already stopped, so there was nothing to do.
+    Identity,
+    /// Stopped and all devices torn down.
+    Stopped(T),
+    /// Went from partially stopped state to fully stopped with all devices
+    /// torn down.
+    CleanedUp(T),
+    /// Stopped, but some devices not torn down.
+    Partial(T),
+}
+
+impl Display for StopAction<PoolUuid> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StopAction::Identity => write!(
+                f,
+                "The requested pool is already stopped; no action was taken"
+            ),
+            StopAction::CleanedUp(uuid) => write!(
+                f,
+                "The pool with UUID {uuid} was partially constructed and cleaned up successfully",
+            ),
+            StopAction::Stopped(uuid) => {
+                write!(f, "The pool with UUID {uuid} was successfully stopped")
+            }
+            StopAction::Partial(uuid) => {
+                write!(f, "The pool with UUID {uuid} was stopped, but some component devices could not be removed")
+            }
+        }
+    }
+}
+
+impl<T> EngineAction for StopAction<T> {
+    type Return = T;
+
+    fn is_changed(&self) -> bool {
+        matches!(self, StopAction::Stopped(_))
+    }
+
+    fn changed(self) -> Option<Self::Return> {
+        match self {
+            StopAction::Stopped(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// Action indicating the result of growing a block device or block devices in a pool.
+#[derive(Clone)]
+pub enum GrowAction<T> {
+    Identity,
+    Grown(T),
+}
+
+impl Display for GrowAction<(PoolUuid, DevUuid)> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GrowAction::Identity => write!(
+                f,
+                "No changes to block device size were detected; no action taken"
+            ),
+            GrowAction::Grown((pool_uuid, dev_uuid)) => {
+                write!(f, "Block device with UUID {dev_uuid} belonging to pool with UUID {pool_uuid} was successfully grown and more space is now available to the pool")
+            }
+        }
+    }
+}
+
+impl<T> EngineAction for GrowAction<T> {
+    type Return = T;
+
+    fn is_changed(&self) -> bool {
+        matches!(self, GrowAction::Grown(_))
+    }
+
+    fn changed(self) -> Option<Self::Return> {
+        match self {
+            GrowAction::Identity => None,
+            GrowAction::Grown(t) => Some(t),
+        }
+    }
+}
+
+/// Convert a value to a displayable format.
+pub trait ToDisplay {
+    type Display: Display;
+
+    fn to_display(&self) -> Self::Display;
+}
+
+/// Return type when setting a settable property.
+pub enum PropChangeAction<T> {
+    Identity,
+    NewValue(T),
+}
+
+impl<T> ToDisplay for PropChangeAction<Option<T>>
+where
+    T: ToString,
+{
+    type Display = PropChangeAction<String>;
+
+    fn to_display(&self) -> PropChangeAction<String> {
+        match self {
+            PropChangeAction::Identity => PropChangeAction::Identity,
+            PropChangeAction::NewValue(Some(v)) => {
+                PropChangeAction::NewValue(format!("a value of {}", v.to_string()))
+            }
+            PropChangeAction::NewValue(None) => {
+                PropChangeAction::NewValue("an empty value".to_string())
+            }
+        }
+    }
+}
+
+impl ToDisplay for PropChangeAction<bool> {
+    type Display = PropChangeAction<String>;
+
+    fn to_display(&self) -> PropChangeAction<String> {
+        match self {
+            PropChangeAction::Identity => PropChangeAction::Identity,
+            PropChangeAction::NewValue(v) => PropChangeAction::NewValue(format!("a value of {v}")),
+        }
+    }
+}
+
+impl<T> Display for PropChangeAction<T>
+where
+    T: Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PropChangeAction::Identity => write!(f, "No change was made to the given property"),
+            PropChangeAction::NewValue(v) => write!(f, "Property was changed to {v}"),
+        }
+    }
+}
+
+impl<T> EngineAction for PropChangeAction<T> {
+    type Return = T;
+
+    fn is_changed(&self) -> bool {
+        matches!(self, PropChangeAction::NewValue(_))
+    }
+
+    fn changed(self) -> Option<Self::Return> {
+        match self {
+            PropChangeAction::NewValue(t) => Some(t),
+            PropChangeAction::Identity => None,
+        }
+    }
+}
+
+/// Return value indicating a successful reencrypt operation on the pool
+pub struct ReencryptedDevice(pub PoolUuid);
+
+impl Display for ReencryptedDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let uuid = self.0;
+        write!(
+            f,
+            "Reencryption operation on pool with UUID {uuid} was completed successfully"
         )
     }
 }

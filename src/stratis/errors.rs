@@ -2,13 +2,20 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::{collections::HashSet, error::Error, fmt, io, iter::once, str, sync};
+use std::{
+    collections::HashSet,
+    error::Error,
+    fmt, io,
+    iter::once,
+    str,
+    sync::{self, Arc},
+};
 
 use crate::engine::ActionAvailability;
 
 pub type StratisResult<T> = Result<T, StratisError>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum StratisError {
     Msg(String),
     Chained(String, Box<StratisError>),
@@ -22,28 +29,36 @@ pub enum StratisError {
         rollback_error: Box<StratisError>,
         level: ActionAvailability,
     },
+    ActionAvailabilityError {
+        error: Box<StratisError>,
+        level: ActionAvailability,
+    },
     /// This variant should be used for failed roll back that does not
     /// prompt any action in stratisd but needs to be reported to the user.
     NoActionRollbackError {
         causal_error: Box<StratisError>,
         rollback_error: Box<StratisError>,
     },
-    Io(io::Error),
+    ActionDisabled(ActionAvailability),
+    OutOfSpaceError(String),
+    Io(Arc<io::Error>),
     Nix(nix::Error),
     Uuid(uuid::Error),
     Utf8(str::Utf8Error),
-    Serde(serde_json::error::Error),
+    Serde(Arc<serde_json::error::Error>),
     Decode(data_encoding::DecodeError),
     DM(devicemapper::DmError),
-    Crypt(libcryptsetup_rs::LibcryptErr),
+    Crypt(Arc<libcryptsetup_rs::LibcryptErr>),
     Recv(sync::mpsc::RecvError),
     Null(std::ffi::NulError),
-    Join(tokio::task::JoinError),
-    Blkid(libblkid_rs::BlkidErr),
+    Join(Arc<tokio::task::JoinError>),
+    Blkid(Arc<libblkid_rs::BlkidErr>),
 
     #[cfg(feature = "dbus_enabled")]
-    Dbus(dbus::Error),
-    Udev(libudev::Error),
+    Dbus(zbus::Error),
+    #[cfg(feature = "dbus_enabled")]
+    DbusType(zbus::zvariant::Error),
+    Udev(Arc<libudev::Error>),
 }
 
 impl StratisError {
@@ -52,13 +67,23 @@ impl StratisError {
     fn error_to_all_available_actions(&self) -> HashSet<ActionAvailability> {
         match self {
             StratisError::Chained(_, c) => c.error_to_all_available_actions(),
+            StratisError::ActionAvailabilityError { level, error } => once(level)
+                .cloned()
+                .chain(error.error_to_all_available_actions())
+                .collect::<HashSet<_>>(),
             StratisError::BestEffortError(_, errs) => errs
                 .iter()
                 .flat_map(|e| e.error_to_all_available_actions())
                 .collect::<HashSet<_>>(),
-            StratisError::RollbackError { level, .. } => {
-                once(level).cloned().collect::<HashSet<_>>()
-            }
+            StratisError::RollbackError {
+                level,
+                causal_error,
+                rollback_error,
+            } => once(level)
+                .cloned()
+                .chain(causal_error.error_to_all_available_actions())
+                .chain(rollback_error.error_to_all_available_actions())
+                .collect::<HashSet<_>>(),
             StratisError::NoActionRollbackError {
                 causal_error,
                 rollback_error,
@@ -81,18 +106,18 @@ impl StratisError {
 impl fmt::Display for StratisError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            StratisError::Msg(ref s) => write!(f, "{}", s),
-            StratisError::Chained(ref s, ref chained) => write!(f, "{}; {}", s, chained),
+            StratisError::Msg(ref s) => write!(f, "{s}"),
+            StratisError::Chained(ref s, ref chained) => write!(f, "{s}; {chained}"),
             StratisError::BestEffortError(ref s, ref errs) => {
                 if errs.is_empty() {
-                    write!(f, "{}", s)
+                    write!(f, "{s}")
                 } else {
                     let errs_string = errs
                         .iter()
                         .map(|err| err.to_string())
                         .collect::<Vec<_>>()
                         .join("; ");
-                    write!(f, "{}; {}", s, errs_string)
+                    write!(f, "{s}; {errs_string}")
                 }
             }
             StratisError::RollbackError {
@@ -102,8 +127,7 @@ impl fmt::Display for StratisError {
             } => {
                 write!(
                     f,
-                    "Rollback failed; causal_error: {}, rollback error: {}; putting pool in action availability state {}",
-                    causal_error, rollback_error, level,
+                    "Rollback failed; causal_error: {causal_error}, rollback error: {rollback_error}; putting pool in action availability state {level}"
                 )
             }
             StratisError::NoActionRollbackError {
@@ -112,30 +136,48 @@ impl fmt::Display for StratisError {
             } => {
                 write!(
                     f,
-                    "Rollback failed; causal_error: {}, rollback error: {}",
-                    causal_error, rollback_error
+                    "Rollback failed; causal_error: {causal_error}, rollback error: {rollback_error}"
                 )
             }
-            StratisError::Io(ref err) => write!(f, "IO error: {}", err),
-            StratisError::Nix(ref err) => write!(f, "Nix error: {}", err),
-            StratisError::Uuid(ref err) => write!(f, "Uuid error: {}", err),
-            StratisError::Utf8(ref err) => write!(f, "Utf8 error: {}", err),
-            StratisError::Serde(ref err) => write!(f, "Serde error: {}", err),
-            StratisError::Decode(ref err) => write!(f, "Data encoding error: {}", err),
-            StratisError::DM(ref err) => write!(f, "DM error: {}", err),
-            StratisError::Crypt(ref err) => write!(f, "Cryptsetup error: {}", err),
-            StratisError::Recv(ref err) => write!(f, "Synchronization channel error: {}", err),
-            StratisError::Null(ref err) => write!(f, "C string conversion error: {}", err),
-            StratisError::Join(ref err) => write!(f, "Failed to join thread: {}", err),
+            StratisError::OutOfSpaceError(ref msg) => {
+                write!(f, "Pool is out of space and cannot be extended: {msg}")
+            }
+            StratisError::ActionDisabled(ref level) => {
+                write!(f, "Pool is in state {level:?} where this action cannot be performed until the issue is resolved manually")
+            }
+            StratisError::ActionAvailabilityError {
+                ref error,
+                ref level,
+            } => {
+                write!(
+                    f,
+                    "Error that set action availability state {level}: {error}"
+                )
+            }
+            StratisError::Io(ref err) => write!(f, "IO error: {err}"),
+            StratisError::Nix(ref err) => write!(f, "Nix error: {err}"),
+            StratisError::Uuid(ref err) => write!(f, "Uuid error: {err}"),
+            StratisError::Utf8(ref err) => write!(f, "Utf8 error: {err}"),
+            StratisError::Serde(ref err) => write!(f, "Serde error: {err}"),
+            StratisError::Decode(ref err) => write!(f, "Data encoding error: {err}"),
+            StratisError::DM(ref err) => write!(f, "DM error: {err}"),
+            StratisError::Crypt(ref err) => write!(f, "Cryptsetup error: {err}"),
+            StratisError::Recv(ref err) => write!(f, "Synchronization channel error: {err}"),
+            StratisError::Null(ref err) => write!(f, "C string conversion error: {err}"),
+            StratisError::Join(ref err) => write!(f, "Failed to join thread: {err}"),
             StratisError::Blkid(ref err) => {
-                write!(f, "Failed to probe device using blkid: {}", err)
+                write!(f, "Failed to probe device using blkid: {err}")
             }
 
             #[cfg(feature = "dbus_enabled")]
             StratisError::Dbus(ref err) => {
-                write!(f, "Dbus error: {}", err.message().unwrap_or("Unknown"))
+                write!(f, "Dbus error: {err}",)
             }
-            StratisError::Udev(ref err) => write!(f, "Udev error: {}", err),
+            #[cfg(feature = "dbus_enabled")]
+            StratisError::DbusType(ref err) => {
+                write!(f, "Dbus type error: {err}",)
+            }
+            StratisError::Udev(ref err) => write!(f, "Udev error: {err}"),
         }
     }
 }
@@ -144,13 +186,13 @@ impl Error for StratisError {}
 
 impl From<libblkid_rs::BlkidErr> for StratisError {
     fn from(err: libblkid_rs::BlkidErr) -> StratisError {
-        StratisError::Blkid(err)
+        StratisError::Blkid(Arc::new(err))
     }
 }
 
 impl From<tokio::task::JoinError> for StratisError {
     fn from(err: tokio::task::JoinError) -> StratisError {
-        StratisError::Join(err)
+        StratisError::Join(Arc::new(err))
     }
 }
 
@@ -162,7 +204,7 @@ impl From<std::ffi::NulError> for StratisError {
 
 impl From<io::Error> for StratisError {
     fn from(err: io::Error) -> StratisError {
-        StratisError::Io(err)
+        StratisError::Io(Arc::new(err))
     }
 }
 
@@ -186,7 +228,7 @@ impl From<str::Utf8Error> for StratisError {
 
 impl From<serde_json::error::Error> for StratisError {
     fn from(err: serde_json::error::Error) -> StratisError {
-        StratisError::Serde(err)
+        StratisError::Serde(Arc::new(err))
     }
 }
 
@@ -204,20 +246,27 @@ impl From<devicemapper::DmError> for StratisError {
 
 impl From<libcryptsetup_rs::LibcryptErr> for StratisError {
     fn from(err: libcryptsetup_rs::LibcryptErr) -> StratisError {
-        StratisError::Crypt(err)
+        StratisError::Crypt(Arc::new(err))
     }
 }
 
 #[cfg(feature = "dbus_enabled")]
-impl From<dbus::Error> for StratisError {
-    fn from(err: dbus::Error) -> StratisError {
+impl From<zbus::Error> for StratisError {
+    fn from(err: zbus::Error) -> StratisError {
         StratisError::Dbus(err)
+    }
+}
+
+#[cfg(feature = "dbus_enabled")]
+impl From<zbus::zvariant::Error> for StratisError {
+    fn from(err: zbus::zvariant::Error) -> StratisError {
+        StratisError::DbusType(err)
     }
 }
 
 impl From<libudev::Error> for StratisError {
     fn from(err: libudev::Error) -> StratisError {
-        StratisError::Udev(err)
+        StratisError::Udev(Arc::new(err))
     }
 }
 

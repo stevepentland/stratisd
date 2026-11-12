@@ -2,53 +2,74 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    os::fd::RawFd,
+    path::Path,
+    sync::Arc,
+};
 
+use async_trait::async_trait;
+use futures::{executor::block_on, future::join_all};
 use serde_json::Value;
+use tokio::{
+    sync::{mpsc, oneshot, RwLock},
+    task::{spawn_blocking, JoinHandle},
+};
 
 use devicemapper::DmNameBuf;
 
 use crate::{
     engine::{
+        engine::{HandleEvents, KeyActions},
         shared::{create_pool_idempotent_or_err, validate_name, validate_paths},
         strat_engine::{
-            cmd::verify_binaries,
+            backstore::ProcessedPathInfos,
+            cmd::verify_executables,
             dm::get_dm,
-            keys::{MemoryFilesystem, StratKeyActions},
-            liminal::{find_all, LiminalDevices},
-            pool::StratPool,
+            keys::{validate_key_descs, StratKeyActions},
+            liminal::{find_all, DeviceSet, LiminalDevices},
+            names::KeyDescription,
+            ns::MemoryFilesystem,
+            pool::{v1, v2, AnyPool},
         },
-        structures::Table,
+        structures::{
+            AllLockReadAvailableGuard, AllLockReadGuard, AllLockWriteAvailableGuard,
+            AllLockWriteGuard, AllOrSomeLock, Lockable, SomeLockReadGuard, SomeLockWriteGuard,
+            Table,
+        },
         types::{
-            CreateAction, DeleteAction, DevUuid, EncryptionInfo, FilesystemUuid, LockedPoolInfo,
-            RenameAction, ReportType, SetUnlockAction, StratFilesystemDiff, ThinPoolDiff,
-            UdevEngineEvent, UnlockMethod,
+            CreateAction, DeleteAction, DevUuid, FilesystemUuid, InputEncryptionInfo,
+            IntegritySpec, LockedPoolsInfo, PoolDiff, PoolIdentifier, RenameAction, ReportType,
+            SetUnlockAction, StartAction, StopAction, StoppedPoolsInfo, StratFilesystemDiff,
+            TokenUnlockMethod, UdevEngineEvent, UnlockMethod, ValidatedIntegritySpec,
         },
-        Engine, Name, PoolUuid, Report,
+        Engine, Name, Pool, PoolUuid, Report,
     },
     stratis::{StratisError, StratisResult},
 };
 
+type EventNumbers = HashMap<PoolUuid, HashMap<DmNameBuf, u32>>;
+type PoolJoinHandles = Vec<JoinHandle<StratisResult<(PoolUuid, PoolDiff)>>>;
+
 #[derive(Debug)]
 pub struct StratEngine {
-    pools: Table<PoolUuid, StratPool>,
+    pools: AllOrSomeLock<PoolUuid, AnyPool>,
 
     // Maps pool UUIDs to information about sets of devices that are
     // associated with that UUID but have not been converted into a pool.
-    liminal_devices: LiminalDevices,
+    liminal_devices: Lockable<Arc<RwLock<LiminalDevices>>>,
 
     // Maps name of DM devices we are watching to the most recent event number
     // we've handled for each
-    watched_dev_last_event_nrs: HashMap<PoolUuid, HashMap<DmNameBuf, u32>>,
+    watched_dev_last_event_nrs: Lockable<Arc<RwLock<EventNumbers>>>,
 
     // Handler for key operations
-    key_handler: StratKeyActions,
+    key_handler: Arc<StratKeyActions>,
 
-    // TODO: Remove this code when Clevis supports reading keys from the
-    // kernel keyring.
-    // In memory filesystem for passing keys to Clevis.
-    // See GitHub issue: https://github.com/stratis-storage/project/issues/212.
-    key_fs: MemoryFilesystem,
+    // In memory filesystem for private namespace mounts.
+    #[allow(dead_code)]
+    fs: MemoryFilesystem,
 }
 
 impl StratEngine {
@@ -56,13 +77,27 @@ impl StratEngine {
     /// 1. Verify the existence of Stratis /dev directory.
     /// 2. Setup all the pools belonging to the engine.
     ///    a. Places any devices which belong to a pool, but are not complete
-    ///       in the incomplete pools data structure.
+    ///    in the incomplete pools data structure.
     ///
     /// Returns an error if the kernel doesn't support required DM features.
     /// Returns an error if there was an error reading device nodes.
-    /// Returns an error if the binaries on which it depends can not be found.
-    pub fn initialize() -> StratisResult<StratEngine> {
-        verify_binaries()?;
+    /// Returns an error if the executables on which it depends can not be found.
+    /// Returns an error if the udev monitor failed to start.
+    ///
+    /// Blocks until `udev_ready` signals that the udev monitor is listening,
+    /// so that no device event can fall between device enumeration and the
+    /// start of monitoring. This must not be called from an async context
+    /// without `spawn_blocking`.
+    pub fn initialize_after_udev(
+        sender: mpsc::UnboundedSender<KeyDescription>,
+        udev_ready: oneshot::Receiver<()>,
+    ) -> StratisResult<StratEngine> {
+        let fs = MemoryFilesystem::new()?;
+        verify_executables()?;
+
+        udev_ready.blocking_recv().map_err(|_| {
+            StratisError::Msg("udev monitor failed to start; can not enumerate devices".to_string())
+        })?;
 
         let mut liminal_devices = LiminalDevices::default();
         let mut pools = Table::default();
@@ -71,12 +106,283 @@ impl StratEngine {
         }
 
         Ok(StratEngine {
-            pools,
-            liminal_devices,
-            watched_dev_last_event_nrs: HashMap::new(),
-            key_handler: StratKeyActions,
-            key_fs: MemoryFilesystem::new()?,
+            pools: AllOrSomeLock::new(pools),
+            liminal_devices: Lockable::new_shared(liminal_devices),
+            watched_dev_last_event_nrs: Lockable::new_shared(HashMap::new()),
+            key_handler: Arc::new(StratKeyActions::new(sender)),
+            fs,
         })
+    }
+
+    /// Setup a StratEngine without waiting on a udev monitor.
+    #[cfg(test)]
+    pub fn initialize(sender: mpsc::UnboundedSender<KeyDescription>) -> StratisResult<StratEngine> {
+        let (ready, udev_ready) = oneshot::channel();
+        let _ = ready.send(());
+        StratEngine::initialize_after_udev(sender, udev_ready)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn create_pool_legacy(
+        &self,
+        name: &str,
+        blockdev_paths: &[&Path],
+        encryption_info: Option<&InputEncryptionInfo>,
+    ) -> StratisResult<CreateAction<PoolUuid>> {
+        if let Some(ei) = encryption_info {
+            validate_key_descs(ei.key_descs())?;
+        }
+
+        validate_name(name)?;
+        let name = Name::new(name.to_owned());
+
+        validate_paths(blockdev_paths)?;
+
+        let cloned_paths = blockdev_paths
+            .iter()
+            .map(|p| p.to_path_buf())
+            .collect::<Vec<_>>();
+
+        let devices = spawn_blocking!({
+            let borrowed_paths = cloned_paths.iter().map(|p| p.as_path()).collect::<Vec<_>>();
+            ProcessedPathInfos::try_from(borrowed_paths.as_slice())
+        })??;
+
+        let (stratis_devices, unowned_devices) = devices.unpack();
+
+        let maybe_guard = self.pools.read(PoolIdentifier::Name(name.clone())).await;
+        if let Some(guard) = maybe_guard {
+            let (name, uuid, pool) = guard.as_tuple();
+
+            let (this_pool, other_pools) = stratis_devices.partition(uuid);
+            other_pools.error_on_not_empty()?;
+
+            create_pool_idempotent_or_err(
+                pool,
+                &name,
+                &this_pool
+                    .values()
+                    .map(|info| info.devnode.as_path())
+                    .chain(
+                        unowned_devices
+                            .unpack()
+                            .iter()
+                            .map(|info| info.devnode.as_path()),
+                    )
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            stratis_devices.error_on_not_empty()?;
+
+            if unowned_devices.is_empty() {
+                return Err(StratisError::Msg(
+                    "At least one blockdev is required to create a pool.".to_string(),
+                ));
+            }
+
+            let block_size_summary = unowned_devices.blocksizes();
+            if block_size_summary.len() > 1 {
+                let err_str = "The devices specified for initializing the pool do not all have the same physical sector size or do not all have the same logical sector size".into();
+                return Err(StratisError::Msg(err_str));
+            }
+
+            let cloned_name = name.clone();
+            let cloned_enc_info = encryption_info.cloned();
+
+            let pool_uuid = {
+                let mut pools = self.pools.modify_all().await;
+                let (pool_uuid, pool) = spawn_blocking!({
+                    v1::StratPool::initialize(
+                        &cloned_name,
+                        unowned_devices,
+                        cloned_enc_info.as_ref(),
+                    )
+                })??;
+                pools.insert(
+                    Name::new(name.to_string()),
+                    pool_uuid,
+                    AnyPool::V1(Box::new(pool)),
+                );
+                pool_uuid
+            };
+
+            Ok(CreateAction::Created(pool_uuid))
+        }
+    }
+
+    async fn upgrade_pool(
+        &self,
+        lock: SomeLockReadGuard<PoolUuid, dyn Pool>,
+    ) -> SomeLockWriteGuard<PoolUuid, AnyPool> {
+        self.pools.upgrade(lock).await
+    }
+
+    pub async fn get_pool(
+        &self,
+        key: PoolIdentifier<PoolUuid>,
+    ) -> Option<SomeLockReadGuard<PoolUuid, AnyPool>> {
+        get_pool!(self; key)
+    }
+
+    pub async fn get_mut_pool(
+        &self,
+        key: PoolIdentifier<PoolUuid>,
+    ) -> Option<SomeLockWriteGuard<PoolUuid, AnyPool>> {
+        get_mut_pool!(self; key)
+    }
+
+    pub async fn pools(&self) -> AllLockReadGuard<PoolUuid, AnyPool> {
+        self.pools.read_all().await
+    }
+
+    pub async fn available_pools(&self) -> Option<AllLockReadAvailableGuard<PoolUuid, AnyPool>> {
+        self.pools.read_all_available().await
+    }
+
+    pub async fn pools_mut(&self) -> AllLockWriteGuard<PoolUuid, AnyPool> {
+        self.pools.write_all().await
+    }
+
+    pub async fn available_pools_mut(
+        &self,
+    ) -> Option<AllLockWriteAvailableGuard<PoolUuid, AnyPool>> {
+        self.pools.write_all_available().await
+    }
+
+    fn spawn_pool_check_handling(
+        joins: &mut PoolJoinHandles,
+        mut guard: SomeLockWriteGuard<PoolUuid, AnyPool>,
+    ) {
+        joins.push(spawn_blocking(move || {
+            let (name, uuid, pool) = guard.as_mut_tuple();
+            Ok((
+                uuid,
+                match pool {
+                    AnyPool::V1(p) => p.event_on(uuid, &name)?,
+                    AnyPool::V2(p) => p.event_on(uuid, &name)?,
+                },
+            ))
+        }));
+    }
+
+    fn spawn_fs_check_handling(
+        joins: &mut Vec<JoinHandle<StratisResult<HashMap<FilesystemUuid, StratFilesystemDiff>>>>,
+        mut guard: SomeLockWriteGuard<PoolUuid, AnyPool>,
+    ) {
+        joins.push(spawn_blocking(move || {
+            let (_, uuid, pool) = guard.as_mut_tuple();
+            match pool {
+                AnyPool::V1(p) => p.fs_event_on(uuid),
+                AnyPool::V2(p) => p.fs_event_on(uuid),
+            }
+        }));
+    }
+
+    async fn join_all_pool_checks(handles: PoolJoinHandles) -> HashMap<PoolUuid, PoolDiff> {
+        join_all(handles)
+            .await
+            .into_iter()
+            .filter_map(|res| match res {
+                Ok(Ok(tup)) => Some(tup),
+                Ok(Err(StratisError::ActionDisabled(_))) => None,
+                Ok(Err(e)) => {
+                    warn!("Pool checks failed with error: {e}");
+                    None
+                }
+                Err(e) => {
+                    warn!("Failed to get status for thread handling pool checks: {e}");
+                    None
+                }
+            })
+            .collect::<HashMap<_, _>>()
+    }
+
+    async fn join_all_fs_checks(
+        handles: Vec<JoinHandle<StratisResult<HashMap<FilesystemUuid, StratFilesystemDiff>>>>,
+    ) -> HashMap<FilesystemUuid, StratFilesystemDiff> {
+        join_all(handles)
+            .await
+            .into_iter()
+            .fold(HashMap::default(), |mut acc, next| match next {
+                Ok(Ok(hm)) => {
+                    acc.extend(hm);
+                    acc
+                }
+                Ok(Err(StratisError::ActionDisabled(_))) => acc,
+                Ok(Err(e)) => {
+                    warn!("Filesystem checks failed with error: {e}");
+                    acc
+                }
+                Err(e) => {
+                    warn!("Failed to get status for thread handling filesystem checks: {e}");
+                    acc
+                }
+            })
+    }
+
+    /// The implementation for pool_evented when caused by a devicemapper event.
+    async fn pool_evented_dm(&self, pools: &HashSet<PoolUuid>) -> HashMap<PoolUuid, PoolDiff> {
+        let mut joins = Vec::new();
+        for uuid in pools {
+            if let Some(guard) = self.pools.write(PoolIdentifier::Uuid(*uuid)).await {
+                Self::spawn_pool_check_handling(&mut joins, guard);
+            } else {
+                warn!(
+                    "Pool with UUID {uuid} indicated an event but could not be found when attempting to handle the event; it may have been deleted during the time between detection and handling"
+                );
+            }
+        }
+
+        Self::join_all_pool_checks(joins).await
+    }
+
+    /// The implementation for pool_evented when called by the timer thread.
+    async fn pool_evented_timer(&self) -> HashMap<PoolUuid, PoolDiff> {
+        let mut joins = Vec::new();
+        let guards: Vec<SomeLockWriteGuard<PoolUuid, AnyPool>> =
+            match self.pools.write_all_available().await {
+                Some(g) => g.into(),
+                None => return HashMap::default(),
+            };
+        for guard in guards {
+            Self::spawn_pool_check_handling(&mut joins, guard);
+        }
+
+        Self::join_all_pool_checks(joins).await
+    }
+
+    /// The implementation for fs_evented when caused by a devicemapper event.
+    async fn fs_evented_dm(
+        &self,
+        pools: &HashSet<PoolUuid>,
+    ) -> HashMap<FilesystemUuid, StratFilesystemDiff> {
+        let mut joins = Vec::new();
+        for uuid in pools {
+            if let Some(guard) = self.pools.write(PoolIdentifier::Uuid(*uuid)).await {
+                Self::spawn_fs_check_handling(&mut joins, guard);
+            } else {
+                warn!(
+                    "Pool with UUID {uuid} indicated an event but could not be found when attempting to handle the event; it may have been deleted during the time between detection and handling"
+                );
+            }
+        }
+
+        Self::join_all_fs_checks(joins).await
+    }
+
+    /// The implementation for fs_evented when called by the timer thread.
+    async fn fs_evented_timer(&self) -> HashMap<FilesystemUuid, StratFilesystemDiff> {
+        let mut joins = Vec::new();
+        let guards: Vec<SomeLockWriteGuard<PoolUuid, AnyPool>> =
+            match self.pools.write_all_available().await {
+                Some(g) => g.into(),
+                None => return HashMap::default(),
+            };
+        for guard in guards {
+            Self::spawn_fs_check_handling(&mut joins, guard);
+        }
+
+        Self::join_all_fs_checks(joins).await
     }
 
     /// Recursively remove all devicemapper devices in all pools.
@@ -84,55 +390,77 @@ impl StratEngine {
     #[cfg(test)]
     pub fn teardown(self) -> StratisResult<()> {
         let mut untorndown_pools = Vec::new();
-        for (_, uuid, mut pool) in self.pools {
-            pool.teardown()
-                .unwrap_or_else(|_| untorndown_pools.push(uuid));
+        let mut write_all = block_on(self.pools.write_all());
+        for (_, uuid, pool) in write_all.iter_mut() {
+            match pool {
+                AnyPool::V1(p) => p.teardown(*uuid),
+                AnyPool::V2(p) => p.teardown(*uuid),
+            }
+            .unwrap_or_else(|_| untorndown_pools.push(uuid));
         }
         if untorndown_pools.is_empty() {
             Ok(())
         } else {
-            let err_msg = format!(
-                "Failed to teardown already set up pools: {:?}",
-                untorndown_pools
-            );
+            let err_msg = format!("Failed to teardown already set up pools: {untorndown_pools:?}");
             Err(StratisError::Msg(err_msg))
         }
     }
 }
 
-impl<'a> Into<Value> for &'a StratEngine {
+impl Into<Value> for &StratEngine {
     // Precondition: (&StratPool).into() pattern matches Value::Object(_)
     // Precondition: (&LiminalDevices).into() pattern matches Value::Object(_)
     fn into(self) -> Value {
-        let json = json!({
-            "pools": Value::Array(
-                self.pools.iter()
-                    .map(|(name, uuid, pool)| {
-                        let mut json = json!({
-                            "uuid": Value::from(uuid.to_string()),
-                            "name": Value::from(name.to_string()),
-                        });
-                        if let Value::Object(ref mut map) = json {
+        let mut pools: Vec<Value> = block_on(self.pools.read_all())
+            .iter()
+            .map(|(name, uuid, pool)| {
+                let mut json = json!({
+                    "uuid": Value::from(uuid.to_string()),
+                    "name": Value::from(name.to_string()),
+                });
+                if let Value::Object(ref mut map) = json {
+                    match pool {
+                        AnyPool::V1(p) => {
                             map.extend(
-                                if let Value::Object(map) = <&StratPool as Into<Value>>::into(pool) {
+                                if let Value::Object(map) = <&v1::StratPool as Into<Value>>::into(p)
+                                {
                                     map.into_iter()
                                 } else {
                                     unreachable!("StratPool conversion returns a JSON object");
-                                }
+                                },
                             );
-                        } else {
-                            unreachable!("json!() always creates a JSON object")
                         }
-                        json
-                    })
-                    .collect()
-            ),
+                        AnyPool::V2(p) => {
+                            map.extend(
+                                if let Value::Object(map) = <&v2::StratPool as Into<Value>>::into(p)
+                                {
+                                    map.into_iter()
+                                } else {
+                                    unreachable!("StratPool conversion returns a JSON object");
+                                },
+                            );
+                        }
+                    }
+                } else {
+                    unreachable!("json!() always creates a JSON object")
+                }
+                json
+            })
+            .collect();
+        pools.sort_unstable_by_key(|p| {
+            p["uuid"]
+                .as_str()
+                .expect("inserted as string in previous line")
+                .to_string()
+        });
+        let json = json!({
+            "pools": Value::Array(pools),
         });
         if let (Value::Object(mut j), Value::Object(map)) = (
             json,
-            <&LiminalDevices as Into<Value>>::into(&self.liminal_devices),
+            <&LiminalDevices as Into<Value>>::into(&*self.liminal_devices.blocking_read()),
         ) {
-            j.extend(map.into_iter());
+            j.extend(map);
             Value::Object(j)
         } else {
             unreachable!("json!() and LiminalDevices::into() always return JSON object");
@@ -147,147 +475,344 @@ impl Report for StratEngine {
 
     fn get_report(&self, report_type: ReportType) -> Value {
         match report_type {
-            ReportType::ErroredPoolDevices => (&self.liminal_devices).into(),
+            ReportType::StoppedPools => (&*self.liminal_devices.blocking_read()).into(),
         }
     }
 }
 
+#[async_trait]
 impl Engine for StratEngine {
-    type Pool = StratPool;
-    type KeyActions = StratKeyActions;
+    async fn handle_events(&self, events: Vec<UdevEngineEvent>) -> HandleEvents<dyn Pool> {
+        let mut ret_guards = Vec::new();
+        let mut diffs = HashMap::new();
 
-    fn handle_event(&mut self, event: &UdevEngineEvent) -> Option<(Name, PoolUuid, &Self::Pool)> {
-        if let Some((pool_uuid, pool_name, pool)) =
-            self.liminal_devices.block_evaluate(&self.pools, event)
-        {
-            self.pools.insert(pool_name.clone(), pool_uuid, pool);
-            Some((
-                pool_name,
-                pool_uuid,
-                self.pools.get_by_uuid(pool_uuid).expect("just_inserted").1,
-            ))
-        } else {
-            None
-        }
+        // Acquire a write lock here so that no concurrent accesses can occur between
+        // udev event handling and insertion into the pool.
+        //
+        // Failing to do this can cause two identical pools to be registered in
+        // internal data structures.
+        let mut pools_write_all = self.pools.modify_all().await;
+        let mut ld_guard = self.liminal_devices.write().await;
+
+        match spawn_blocking!({
+            events
+                .iter()
+                .map(|event| {
+                    let uuid = if let Some((name, uuid, pool)) =
+                        ld_guard.block_evaluate(&pools_write_all, event)
+                    {
+                        pools_write_all.insert(name, uuid, pool);
+                        Some(uuid)
+                    } else {
+                        None
+                    };
+                    match LiminalDevices::block_evaluate_size(&mut pools_write_all, event) {
+                        Ok(Some((dev_uuid, diff))) => (uuid, Some((dev_uuid, diff))),
+                        Ok(None) => (uuid, None),
+                        Err(e) => {
+                            warn!("Ignoring device size change handling due to error: {e}");
+                            (uuid, None)
+                        }
+                    }
+                })
+                .fold(
+                    (Vec::new(), HashMap::new()),
+                    |(mut uuids, mut diffs), (uuid, info)| {
+                        if let Some(u) = uuid {
+                            uuids.push(u);
+                        }
+                        if let Some((dev_uuid, diff)) = info {
+                            diffs.insert(dev_uuid, diff);
+                        }
+                        (uuids, diffs)
+                    },
+                )
+        }) {
+            Ok((uuids, diffs_thread)) => {
+                for uuid in uuids {
+                    if let Some(guard) = self.pools.read(PoolIdentifier::Uuid(uuid)).await {
+                        ret_guards.push(guard.into_dyn());
+                    }
+                }
+                diffs.extend(diffs_thread);
+            }
+            Err(e) => {
+                warn!("Failed to handle udev events: {e}");
+            }
+        };
+
+        (ret_guards, diffs)
     }
 
-    fn create_pool(
-        &mut self,
+    async fn create_pool(
+        &self,
         name: &str,
         blockdev_paths: &[&Path],
-        redundancy: Option<u16>,
-        encryption_info: Option<&EncryptionInfo>,
+        encryption_info: Option<&InputEncryptionInfo>,
+        integrity_spec: IntegritySpec,
     ) -> StratisResult<CreateAction<PoolUuid>> {
-        let redundancy = calculate_redundancy!(redundancy);
+        if let Some(ei) = encryption_info {
+            validate_key_descs(ei.key_descs())?;
+        }
 
         validate_name(name)?;
+        let name = Name::new(name.to_owned());
+        let integrity_spec = ValidatedIntegritySpec::try_from(integrity_spec)?;
 
         validate_paths(blockdev_paths)?;
 
-        match self.pools.get_by_name(name) {
-            Some((_, pool)) => create_pool_idempotent_or_err(pool, name, blockdev_paths),
-            None => {
-                if blockdev_paths.is_empty() {
-                    Err(StratisError::Msg(
-                        "At least one blockdev is required to create a pool.".to_string(),
-                    ))
-                } else {
-                    let (uuid, pool) =
-                        StratPool::initialize(name, blockdev_paths, redundancy, encryption_info)?;
+        let cloned_paths = blockdev_paths
+            .iter()
+            .map(|p| p.to_path_buf())
+            .collect::<Vec<_>>();
 
-                    let name = Name::new(name.to_owned());
-                    self.pools.insert(name, uuid, pool);
-                    Ok(CreateAction::Created(uuid))
-                }
+        let devices = spawn_blocking!({
+            let borrowed_paths = cloned_paths.iter().map(|p| p.as_path()).collect::<Vec<_>>();
+            ProcessedPathInfos::try_from(borrowed_paths.as_slice())
+        })??;
+
+        let (stratis_devices, unowned_devices) = devices.unpack();
+
+        let maybe_guard = self.pools.read(PoolIdentifier::Name(name.clone())).await;
+        if let Some(guard) = maybe_guard {
+            let (name, uuid, pool) = guard.as_tuple();
+
+            let (this_pool, other_pools) = stratis_devices.partition(uuid);
+            other_pools.error_on_not_empty()?;
+
+            create_pool_idempotent_or_err(
+                pool,
+                &name,
+                &this_pool
+                    .values()
+                    .map(|info| info.devnode.as_path())
+                    .chain(
+                        unowned_devices
+                            .unpack()
+                            .iter()
+                            .map(|info| info.devnode.as_path()),
+                    )
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            stratis_devices.error_on_not_empty()?;
+
+            if unowned_devices.is_empty() {
+                return Err(StratisError::Msg(
+                    "At least one blockdev is required to create a pool.".to_string(),
+                ));
             }
+
+            let block_size_summary = unowned_devices.blocksizes();
+            if block_size_summary.len() > 1 {
+                let err_str = "The devices specified for initializing the pool do not all have the same physical sector size or do not all have the same logical sector size".into();
+                return Err(StratisError::Msg(err_str));
+            }
+
+            let cloned_name = name.clone();
+            let cloned_enc_info = encryption_info.cloned();
+
+            let pool_uuid = {
+                let mut pools = self.pools.modify_all().await;
+                let (pool_uuid, pool) = spawn_blocking!({
+                    v2::StratPool::initialize(
+                        &cloned_name,
+                        unowned_devices,
+                        cloned_enc_info.as_ref(),
+                        integrity_spec,
+                    )
+                })??;
+                pools.insert(
+                    Name::new(name.to_string()),
+                    pool_uuid,
+                    AnyPool::V2(Box::new(pool)),
+                );
+                pool_uuid
+            };
+
+            Ok(CreateAction::Created(pool_uuid))
         }
     }
 
-    fn destroy_pool(&mut self, uuid: PoolUuid) -> StratisResult<DeleteAction<PoolUuid>> {
-        if let Some((_, pool)) = self.pools.get_by_uuid(uuid) {
-            if pool.has_filesystems() {
+    async fn destroy_pool(&self, uuid: PoolUuid) -> StratisResult<DeleteAction<PoolUuid>> {
+        if let Some(pool) = self.pools.read(PoolIdentifier::Uuid(uuid)).await {
+            if match &*pool {
+                AnyPool::V1(p) => p.has_filesystems(),
+                AnyPool::V2(p) => p.has_filesystems(),
+            } {
                 return Err(StratisError::Msg("filesystems remaining on pool".into()));
-            };
+            }
         } else {
             return Ok(DeleteAction::Identity);
         }
 
-        let (pool_name, mut pool) = self
-            .pools
-            .remove_by_uuid(uuid)
-            .expect("Must succeed since self.pools.get_by_uuid() returned a value");
+        let mut guard = self.pools.modify_all().await;
+        let (pool_name, mut pool) = match guard.remove_by_uuid(uuid) {
+            Some(value) => value,
+            None => return Ok(DeleteAction::Identity),
+        };
 
-        if let Err(err) = pool.destroy() {
-            self.pools.insert(pool_name, uuid, pool);
+        let (res, mut pool) = spawn_blocking!((
+            match pool {
+                AnyPool::V1(ref mut p) => p.destroy(uuid),
+                AnyPool::V2(ref mut p) => p.destroy(uuid),
+            },
+            pool
+        ))?;
+        if let Err((err, true)) = res {
+            guard.insert(pool_name, uuid, pool);
+            Err(err)
+        } else if let Err((err, false)) = res {
+            // We use blkid to scan for existing devices with this pool UUID and device UUIDs
+            // because some of the block devices could have been destroyed above. Using the
+            // cached data structures alone could result in phantom devices that have already
+            // been destroyed but are still recorded in the stopped pool.
+            let device_set = match pool {
+                AnyPool::V1(ref mut p) => DeviceSet::from(
+                    p.blockdevs()
+                        .into_iter()
+                        .map(|(_, _, bd)| bd)
+                        .collect::<Vec<_>>(),
+                ),
+                AnyPool::V2(ref mut p) => DeviceSet::from(
+                    p.blockdevs()
+                        .into_iter()
+                        .map(|(_, _, bd)| bd)
+                        .collect::<Vec<_>>(),
+                ),
+            };
+            self.liminal_devices
+                .write()
+                .await
+                .handle_stopped_pool(uuid, device_set);
             Err(err)
         } else {
             Ok(DeleteAction::Deleted(uuid))
         }
     }
 
-    fn rename_pool(
-        &mut self,
+    async fn rename_pool(
+        &self,
         uuid: PoolUuid,
         new_name: &str,
     ) -> StratisResult<RenameAction<PoolUuid>> {
         validate_name(new_name)?;
-        let old_name = rename_pool_pre_idem!(self; uuid; new_name);
-
-        let (_, mut pool) = self
-            .pools
-            .remove_by_uuid(uuid)
-            .expect("Must succeed since self.pools.get_by_uuid() returned a value");
-
         let new_name = Name::new(new_name.to_owned());
-        if let Err(err) = pool.write_metadata(&new_name) {
-            self.pools.insert(old_name, uuid, pool);
+        let old_name = rename_pool_pre_idem!(self; uuid; new_name.clone());
+
+        let mut guard = self.pools.modify_all().await;
+        let mut pool = match guard.remove_by_uuid(uuid) {
+            Some((_, pool)) => pool,
+            None => return Ok(RenameAction::NoSource),
+        };
+
+        let cloned_new_name = new_name.clone();
+        let (res, pool) = spawn_blocking!({
+            let res = match pool {
+                AnyPool::V1(ref mut p) => p.rename_pool(&cloned_new_name),
+                AnyPool::V2(_) => Ok(()),
+            };
+            (
+                res.and_then(|_| match pool {
+                    AnyPool::V1(ref mut p) => p.write_metadata(&cloned_new_name),
+                    AnyPool::V2(ref mut p) => p.write_metadata(&cloned_new_name),
+                }),
+                pool,
+            )
+        })?;
+        if let Err(err) = res {
+            guard.insert(old_name, uuid, pool);
             Err(err)
         } else {
-            self.pools.insert(new_name, uuid, pool);
-            let (new_name, pool) = self.pools.get_by_uuid(uuid).expect("Inserted above");
-            pool.udev_pool_change(&new_name);
+            guard.insert(new_name, uuid, pool);
+            let (new_name, pool) = guard.get_by_uuid(uuid).expect("Inserted above");
+            match pool {
+                AnyPool::V1(p) => p.udev_pool_change(&new_name),
+                AnyPool::V2(p) => p.udev_pool_change(&new_name),
+            };
             Ok(RenameAction::Renamed(uuid))
         }
     }
 
-    fn unlock_pool(
-        &mut self,
+    async fn unlock_pool(
+        &self,
         pool_uuid: PoolUuid,
         unlock_method: UnlockMethod,
     ) -> StratisResult<SetUnlockAction<DevUuid>> {
-        let unlocked = self
-            .liminal_devices
-            .unlock_pool(&self.pools, pool_uuid, unlock_method)?;
-        Ok(SetUnlockAction::new(unlocked))
+        let pool_id = PoolIdentifier::Uuid(pool_uuid);
+        if let Some(lock) = self.pools.read(pool_id.clone()).await {
+            let (_, pool_uuid, pool) = lock.as_tuple();
+            if !pool.is_encrypted() {
+                return Err(StratisError::Msg(format!(
+                    "Pool with UUID {pool_uuid} is not encrypted but an attempt is being made to unlock it"
+                )));
+            } else {
+                Ok(SetUnlockAction::identity())
+            }
+        } else {
+            let mut pools = self.pools.modify_all().await;
+            let mut liminal = self.liminal_devices.write().await;
+            let unlocked_uuids = spawn_blocking!({
+                let (name, pool_uuid, pool, unlocked_uuids) = liminal.start_pool(
+                    &pools,
+                    PoolIdentifier::Uuid(pool_uuid),
+                    TokenUnlockMethod::from(Some(unlock_method)),
+                    None,
+                    false,
+                )?;
+                pools.insert(name, pool_uuid, pool);
+                StratisResult::Ok(unlocked_uuids)
+            })??;
+            Ok(SetUnlockAction::new(unlocked_uuids))
+        }
     }
 
-    fn get_pool(&self, uuid: PoolUuid) -> Option<(Name, &Self::Pool)> {
-        get_pool!(self; uuid)
+    async fn upgrade_pool(
+        &self,
+        lock: SomeLockReadGuard<PoolUuid, dyn Pool>,
+    ) -> SomeLockWriteGuard<PoolUuid, dyn Pool> {
+        self.upgrade_pool(lock).await.into_dyn()
     }
 
-    fn get_mut_pool(&mut self, uuid: PoolUuid) -> Option<(Name, &mut Self::Pool)> {
-        get_mut_pool!(self; uuid)
+    async fn get_pool(
+        &self,
+        key: PoolIdentifier<PoolUuid>,
+    ) -> Option<SomeLockReadGuard<PoolUuid, dyn Pool>> {
+        self.get_pool(key).await.map(|l| l.into_dyn())
     }
 
-    fn locked_pools(&self) -> HashMap<PoolUuid, LockedPoolInfo> {
-        self.liminal_devices.locked_pools()
+    async fn get_mut_pool(
+        &self,
+        key: PoolIdentifier<PoolUuid>,
+    ) -> Option<SomeLockWriteGuard<PoolUuid, dyn Pool>> {
+        self.get_mut_pool(key).await.map(|l| l.into_dyn())
     }
 
-    fn pools(&self) -> Vec<(Name, PoolUuid, &Self::Pool)> {
-        self.pools
-            .iter()
-            .map(|(name, uuid, pool)| (name.clone(), *uuid, pool))
-            .collect()
+    async fn locked_pools(&self) -> LockedPoolsInfo {
+        self.liminal_devices.read().await.locked_pools()
     }
 
-    fn pools_mut(&mut self) -> Vec<(Name, PoolUuid, &mut Self::Pool)> {
-        self.pools
-            .iter_mut()
-            .map(|(name, uuid, pool)| (name.clone(), *uuid, pool))
-            .collect()
+    async fn stopped_pools(&self) -> StoppedPoolsInfo {
+        self.liminal_devices.read().await.stopped_pools()
     }
 
-    fn get_events(&mut self) -> StratisResult<Vec<PoolUuid>> {
+    async fn pools(&self) -> AllLockReadGuard<PoolUuid, dyn Pool> {
+        self.pools().await.into_dyn()
+    }
+
+    async fn available_pools(&self) -> Option<AllLockReadAvailableGuard<PoolUuid, dyn Pool>> {
+        self.available_pools().await.map(|l| l.into_dyn())
+    }
+
+    async fn pools_mut(&self) -> AllLockWriteGuard<PoolUuid, dyn Pool> {
+        self.pools_mut().await.into_dyn()
+    }
+
+    async fn available_pools_mut(&self) -> Option<AllLockWriteAvailableGuard<PoolUuid, dyn Pool>> {
+        self.available_pools_mut().await.map(|l| l.into_dyn())
+    }
+
+    async fn get_events(&self) -> StratisResult<HashSet<PoolUuid>> {
         let device_list: HashMap<_, _> = get_dm()
             .list_devices()?
             .into_iter()
@@ -299,9 +824,14 @@ impl Engine for StratEngine {
             })
             .collect();
 
-        let mut changed = Vec::new();
-        for (_, pool_uuid, pool) in self.pools.iter_mut() {
-            let dev_names = pool.get_eventing_dev_names(*pool_uuid);
+        let mut changed = HashSet::new();
+        let read_pools = self.pools.read_all().await;
+        let mut write_event_nrs = self.watched_dev_last_event_nrs.write().await;
+        for (_, pool_uuid, pool) in read_pools.iter() {
+            let dev_names = match pool {
+                AnyPool::V1(p) => p.get_eventing_dev_names(*pool_uuid),
+                AnyPool::V2(p) => p.get_eventing_dev_names(*pool_uuid),
+            };
             let event_nrs = device_list
                 .iter()
                 .filter_map(|(dm_name, event_nr)| {
@@ -313,141 +843,126 @@ impl Engine for StratEngine {
                 })
                 .collect::<HashMap<_, _>>();
 
-            if self.watched_dev_last_event_nrs.get(pool_uuid) != Some(&event_nrs) {
-                changed.push(*pool_uuid);
+            if write_event_nrs.get(pool_uuid) != Some(&event_nrs) {
+                changed.insert(*pool_uuid);
             }
 
-            self.watched_dev_last_event_nrs
-                .insert(*pool_uuid, event_nrs);
+            write_event_nrs.insert(*pool_uuid, event_nrs);
         }
 
         Ok(changed)
     }
 
-    fn pool_evented(
-        &mut self,
-        pools: Option<&Vec<PoolUuid>>,
-    ) -> StratisResult<HashMap<PoolUuid, ThinPoolDiff>> {
-        fn handle_eventing(
-            name: &Name,
-            uuid: PoolUuid,
-            pool: &mut StratPool,
-            changed: &mut HashMap<PoolUuid, ThinPoolDiff>,
-            errors: &mut Vec<StratisError>,
-        ) {
-            match pool.event_on(uuid, name) {
-                Ok(diff) => {
-                    if diff.is_changed() {
-                        changed.insert(uuid, diff);
-                    }
-                }
-                Err(e) => {
-                    errors.push(e);
-                }
-            }
-        }
-
-        let mut changed = HashMap::default();
-        let mut errors = Vec::new();
-
+    async fn pool_evented(&self, pools: Option<&HashSet<PoolUuid>>) -> HashMap<PoolUuid, PoolDiff> {
         match pools {
-            Some(ps) => {
-                for uuid in ps {
-                    if let Some((name, pool)) = self.pools.get_mut_by_uuid(*uuid) {
-                        handle_eventing(&name, *uuid, pool, &mut changed, &mut errors);
-                    } else {
-                        errors.push(StratisError::Msg(format!(
-                            "Pool with UUID {} could not be found",
-                            uuid
-                        )));
-                    }
-                }
-            }
-            None => {
-                for (name, uuid, pool) in self.pools.iter_mut() {
-                    handle_eventing(name, *uuid, pool, &mut changed, &mut errors);
-                }
-            }
-        }
-
-        if errors.is_empty() {
-            Ok(changed)
-        } else {
-            let msg = if changed.is_empty() {
-                "The following errors were reported while handling devicemapper eventing"
-                    .to_string()
-            } else {
-                format!("Operations on pools with UUIDs {:?} succeeded but the following errors were also reported while handling devicemapper eventing", changed)
-            };
-            Err(StratisError::BestEffortError(msg, errors))
+            Some(ps) => self.pool_evented_dm(ps).await,
+            None => self.pool_evented_timer().await,
         }
     }
 
-    fn fs_evented(
-        &mut self,
-        pools: Option<&Vec<PoolUuid>>,
-    ) -> StratisResult<HashMap<FilesystemUuid, StratFilesystemDiff>> {
-        let mut changed = HashMap::default();
-        let mut errors = Vec::new();
-
-        fn handle_eventing(
-            name: &Name,
-            uuid: PoolUuid,
-            pool: &mut StratPool,
-            changed: &mut HashMap<FilesystemUuid, StratFilesystemDiff>,
-            errors: &mut Vec<StratisError>,
-        ) {
-            match pool.fs_event_on(uuid, name) {
-                Ok(newly_changed) => {
-                    changed.extend(newly_changed);
-                }
-                Err(e) => {
-                    errors.push(e);
-                }
-            }
-        }
-
+    async fn fs_evented(
+        &self,
+        pools: Option<&HashSet<PoolUuid>>,
+    ) -> HashMap<FilesystemUuid, StratFilesystemDiff> {
         match pools {
-            Some(ps) => {
-                for uuid in ps {
-                    if let Some((name, pool)) = self.pools.get_mut_by_uuid(*uuid) {
-                        handle_eventing(&name, *uuid, pool, &mut changed, &mut errors);
-                    } else {
-                        errors.push(StratisError::Msg(format!(
-                            "Pool with UUID {} could not be found",
-                            uuid
-                        )));
-                    }
-                }
-            }
-            None => {
-                for (name, uuid, pool) in self.pools.iter_mut() {
-                    handle_eventing(name, *uuid, pool, &mut changed, &mut errors);
-                }
-            }
+            Some(ps) => self.fs_evented_dm(ps).await,
+            None => self.fs_evented_timer().await,
         }
+    }
 
-        if errors.is_empty() {
-            Ok(changed)
-        } else {
-            let msg = if !changed.is_empty() {
-                format!(
-                    "Operations on filesystems with UUIDs {:?} succeeded but the following errors were also reported while handling devicemapper eventing for filesystems",
-                    changed.keys().collect::<Vec<_>>(),
-                )
+    async fn get_key_handler(&self) -> Arc<dyn KeyActions> {
+        Arc::clone(&self.key_handler) as Arc<dyn KeyActions>
+    }
+
+    async fn start_pool(
+        &self,
+        id: PoolIdentifier<PoolUuid>,
+        token_slot: TokenUnlockMethod,
+        passphrase_fd: Option<RawFd>,
+        remove_cache: bool,
+    ) -> StratisResult<StartAction<PoolUuid>> {
+        if let Some(lock) = self.pools.read(id.clone()).await {
+            let (_, pool_uuid, pool) = lock.as_tuple();
+            if !pool.is_encrypted() && token_slot.is_some() {
+                return Err(StratisError::Msg(format!(
+                    "Pool with UUID {pool_uuid} is not encrypted but an unlock method was provided"
+                )));
+            } else if !pool.is_encrypted() && passphrase_fd.is_some() {
+                return Err(StratisError::Msg(format!(
+                    "Pool with UUID {pool_uuid} is not encrypted but a passphrase was provided"
+                )));
             } else {
-                "The following errors were reported while handling devicemapper eventing for filesystems".to_string()
-            };
-            Err(StratisError::BestEffortError(msg, errors))
+                Ok(StartAction::Identity)
+            }
+        } else {
+            let mut pools = self.pools.modify_all().await;
+            let mut liminal = self.liminal_devices.write().await;
+            let pool_uuid = spawn_blocking!({
+                let (name, pool_uuid, pool, _) =
+                    liminal.start_pool(&pools, id, token_slot, passphrase_fd, remove_cache)?;
+                pools.insert(name, pool_uuid, pool);
+                StratisResult::Ok(pool_uuid)
+            })??;
+            Ok(StartAction::Started(pool_uuid))
         }
     }
 
-    fn get_key_handler(&self) -> &Self::KeyActions {
-        &self.key_handler
+    async fn stop_pool(
+        &self,
+        pool_id: PoolIdentifier<PoolUuid>,
+        has_partially_constructed: bool,
+    ) -> StratisResult<StopAction<PoolUuid>> {
+        let id_str = pool_id.to_string();
+
+        let stopped_pools = self.liminal_devices.read().await.stopped_pools();
+        let pool_uuid = match pool_id {
+            PoolIdentifier::Name(ref n) => stopped_pools.name_to_uuid.get(n).copied(),
+            PoolIdentifier::Uuid(ref u) => Some(*u),
+        };
+        if let Some(pool_uuid) = pool_uuid {
+            if has_partially_constructed {
+                if stopped_pools.stopped.contains_key(&pool_uuid) {
+                    return Ok(StopAction::Identity);
+                } else if stopped_pools.partially_constructed.contains_key(&pool_uuid) {
+                    let mut lim_devs = self.liminal_devices.write().await;
+                    spawn_blocking!(lim_devs.stop_partially_constructed_pool(pool_uuid))??;
+                    return Ok(StopAction::CleanedUp(pool_uuid));
+                }
+            } else if stopped_pools.stopped.contains_key(&pool_uuid)
+                || stopped_pools.partially_constructed.contains_key(&pool_uuid)
+            {
+                return Ok(StopAction::Identity);
+            }
+        }
+
+        let mut pools = self.pools.modify_all().await;
+        if let Some((name, pool_uuid, pool)) = match pool_id {
+            PoolIdentifier::Name(n) => pools.remove_by_name(&n).map(|(u, p)| (n, u, p)),
+            PoolIdentifier::Uuid(u) => pools.remove_by_uuid(u).map(|(n, p)| (n, u, p)),
+        } {
+            let mut lim_devs = self.liminal_devices.write().await;
+            if spawn_blocking!(lim_devs.stop_pool(&mut pools, name, pool_uuid, pool))?? {
+                Ok(StopAction::Stopped(pool_uuid))
+            } else {
+                Ok(StopAction::Partial(pool_uuid))
+            }
+        } else {
+            Err(StratisError::Msg(format!(
+                "Pool with UUID {id_str} could not be found and cannot be stopped"
+            )))
+        }
     }
 
-    fn get_key_handler_mut(&mut self) -> &mut Self::KeyActions {
-        &mut self.key_handler
+    async fn refresh_state(&self) -> StratisResult<()> {
+        let mut pools = self.pools.modify_all().await;
+        *pools = Table::default();
+        let mut lim = self.liminal_devices.write().await;
+        *lim = LiminalDevices::default();
+        let pools_set_up = lim.setup_pools(find_all()?);
+        for (name, uuid, pool) in pools_set_up {
+            pools.insert(name, uuid, pool);
+        }
+        Ok(())
     }
 
     fn is_sim(&self) -> bool {
@@ -457,87 +972,125 @@ impl Engine for StratEngine {
 
 #[cfg(test)]
 mod test {
-    use std::{env, error::Error};
+    use std::{
+        env,
+        panic::{catch_unwind, UnwindSafe},
+        path::Path,
+    };
 
-    use devicemapper::{Bytes, Sectors};
+    use retry::{delay::Fixed, retry};
+    use tokio::sync::mpsc::unbounded_channel;
+
+    use devicemapper::Sectors;
 
     use crate::engine::{
         engine::Pool,
         strat_engine::{
-            backstore::crypt_metadata_size,
             cmd,
-            tests::{crypt, dm_stratis_devices_remove, loopbacked, real, FailDevice},
+            crypt::crypt_metadata_size,
+            ns::unshare_mount_namespace,
+            tests::{crypt, loopbacked, real, FailDevice},
         },
-        types::{ActionAvailability, EngineAction, KeyDescription},
+        types::{ActionAvailability, EngineAction, KeyDescription, OptionalTokenSlotInput},
     };
 
     use super::*;
 
     /// Verify that a pool rename causes the pool metadata to get the new name.
     fn test_pool_rename(paths: &[&Path]) {
-        let mut engine = StratEngine::initialize().unwrap();
+        unshare_mount_namespace().unwrap();
+        let (send, _recv) = unbounded_channel();
+        let engine = StratEngine::initialize(send).unwrap();
 
         let name1 = "name1";
-        let uuid1 = engine
-            .create_pool(name1, paths, None, None)
+        let uuid1 = test_async!(engine.create_pool(name1, paths, None, IntegritySpec::default()))
             .unwrap()
             .changed()
             .unwrap();
+
+        let events = generate_events!();
+        test_async!(engine.handle_events(events));
 
         let fs_name1 = "testfs1";
         let fs_name2 = "testfs2";
-        let (_, pool) = engine.pools.get_mut_by_uuid(uuid1).unwrap();
-        let fs_uuid1 = pool
-            .create_filesystems(name1, uuid1, &[(fs_name1, None)])
-            .unwrap()
-            .changed()
-            .unwrap();
-        let fs_uuid2 = pool
-            .create_filesystems(name1, uuid1, &[(fs_name2, None)])
-            .unwrap()
-            .changed()
-            .unwrap();
+        let (fs_uuid1, fs_uuid2) = {
+            let mut pool = test_async!(engine.get_mut_pool(PoolIdentifier::Uuid(uuid1))).unwrap();
+            let fs_uuid1 = pool
+                .create_filesystems(name1, uuid1, &[(fs_name1, None, None)])
+                .unwrap()
+                .changed()
+                .unwrap();
+            let fs_uuid2 = pool
+                .create_filesystems(name1, uuid1, &[(fs_name2, None, None)])
+                .unwrap()
+                .changed()
+                .unwrap();
+            (fs_uuid1, fs_uuid2)
+        };
 
         cmd::udev_settle().unwrap();
 
-        assert!(Path::new(&format!("/dev/stratis/{}/{}", name1, fs_name1)).exists());
-        assert!(Path::new(&format!("/dev/stratis/{}/{}", name1, fs_name2)).exists());
+        assert!(Path::new(&format!("/dev/stratis/{name1}/{fs_name1}")).exists());
+        assert!(Path::new(&format!("/dev/stratis/{name1}/{fs_name2}")).exists());
 
         let name2 = "name2";
-        let action = engine.rename_pool(uuid1, name2).unwrap();
+        let action = test_async!(engine.rename_pool(uuid1, name2)).unwrap();
 
         cmd::udev_settle().unwrap();
 
-        assert!(!Path::new(&format!("/dev/stratis/{}/{}", name1, fs_name1)).exists());
-        assert!(!Path::new(&format!("/dev/stratis/{}/{}", name1, fs_name2)).exists());
-        assert!(Path::new(&format!("/dev/stratis/{}/{}", name2, fs_name1)).exists());
-        assert!(Path::new(&format!("/dev/stratis/{}/{}", name2, fs_name2)).exists());
+        assert_matches!(
+            retry(Fixed::from_millis(1000).take(3), || {
+                for symlink in [
+                    format!("/dev/stratis/{name1}/{fs_name1}"),
+                    format!("/dev/stratis/{name1}/{fs_name2}"),
+                ] {
+                    if Path::new(&symlink).exists() {
+                        return Err(StratisError::Msg(format!("{symlink} still exists")));
+                    }
+                }
+                for symlink in [
+                    format!("/dev/stratis/{name2}/{fs_name1}"),
+                    format!("/dev/stratis/{name2}/{fs_name2}"),
+                ] {
+                    if !Path::new(&symlink).exists() {
+                        return Err(StratisError::Msg(format!("{symlink} does not exist")));
+                    }
+                }
+                Ok(())
+            }),
+            Ok(())
+        );
 
-        let (_, pool) = engine.pools.get_mut_by_uuid(uuid1).unwrap();
-        pool.destroy_filesystems(
-            name2,
-            fs_uuid1
-                .into_iter()
-                .map(|(_, u, _)| u)
-                .collect::<Vec<_>>()
-                .as_slice(),
-        )
-        .unwrap();
-        pool.destroy_filesystems(
-            name2,
-            fs_uuid2
-                .into_iter()
-                .map(|(_, u, _)| u)
-                .collect::<Vec<_>>()
-                .as_slice(),
-        )
-        .unwrap();
+        {
+            let mut pool = test_async!(engine.get_mut_pool(PoolIdentifier::Uuid(uuid1))).unwrap();
+            pool.destroy_filesystems(
+                name2,
+                &fs_uuid1
+                    .into_iter()
+                    .map(|(_, u, _)| u)
+                    .collect::<HashSet<_>>(),
+            )
+            .unwrap();
+            pool.destroy_filesystems(
+                name2,
+                &fs_uuid2
+                    .into_iter()
+                    .map(|(_, u, _)| u)
+                    .collect::<HashSet<_>>(),
+            )
+            .unwrap();
+        }
 
         assert_eq!(action, RenameAction::Renamed(uuid1));
         engine.teardown().unwrap();
 
-        let engine = StratEngine::initialize().unwrap();
-        let pool_name: String = engine.get_pool(uuid1).unwrap().0.to_owned();
+        let (send, _recv) = unbounded_channel();
+        let engine = StratEngine::initialize(send).unwrap();
+        let pool_name: String = test_async!(engine.get_pool(PoolIdentifier::Uuid(uuid1)))
+            .unwrap()
+            .as_tuple()
+            .0
+            .to_owned();
         assert_eq!(pool_name, name2);
     }
 
@@ -571,38 +1124,42 @@ mod test {
 
         let (paths1, paths2) = paths.split_at(paths.len() / 2);
 
-        let mut engine = StratEngine::initialize().unwrap();
+        let (send, _recv) = unbounded_channel();
+        let engine = StratEngine::initialize(send).unwrap();
 
         let name1 = "name1";
-        let uuid1 = engine
-            .create_pool(name1, paths1, None, None)
+        let uuid1 = test_async!(engine.create_pool(name1, paths1, None, IntegritySpec::default()))
             .unwrap()
             .changed()
             .unwrap();
 
         let name2 = "name2";
-        let uuid2 = engine
-            .create_pool(name2, paths2, None, None)
+        let uuid2 = test_async!(engine.create_pool(name2, paths2, None, IntegritySpec::default()))
             .unwrap()
             .changed()
             .unwrap();
 
-        assert!(engine.get_pool(uuid1).is_some());
-        assert!(engine.get_pool(uuid2).is_some());
+        let events = generate_events!();
+        test_async!(engine.handle_events(events));
+
+        assert!(test_async!(engine.get_pool(PoolIdentifier::Uuid(uuid1))).is_some());
+        assert!(test_async!(engine.get_pool(PoolIdentifier::Uuid(uuid2))).is_some());
 
         engine.teardown().unwrap();
 
-        let engine = StratEngine::initialize().unwrap();
+        let (send, _recv) = unbounded_channel();
+        let engine = StratEngine::initialize(send).unwrap();
 
-        assert!(engine.get_pool(uuid1).is_some());
-        assert!(engine.get_pool(uuid2).is_some());
+        assert!(test_async!(engine.get_pool(PoolIdentifier::Uuid(uuid1))).is_some());
+        assert!(test_async!(engine.get_pool(PoolIdentifier::Uuid(uuid2))).is_some());
 
         engine.teardown().unwrap();
 
-        let engine = StratEngine::initialize().unwrap();
+        let (send, _recv) = unbounded_channel();
+        let engine = StratEngine::initialize(send).unwrap();
 
-        assert!(engine.get_pool(uuid1).is_some());
-        assert!(engine.get_pool(uuid2).is_some());
+        assert!(test_async!(engine.get_pool(PoolIdentifier::Uuid(uuid1))).is_some());
+        assert!(test_async!(engine.get_pool(PoolIdentifier::Uuid(uuid2))).is_some());
 
         engine.teardown().unwrap();
     }
@@ -619,105 +1176,96 @@ mod test {
 
     fn create_pool_and_test_rollback<F>(
         name: &str,
-        paths_with_fail_device: &[&Path],
+        data_paths: &[&Path],
+        cache_paths: Option<&[&Path]>,
         fail_device: &FailDevice,
-        encryption_info: &EncryptionInfo,
+        encryption_info: &InputEncryptionInfo,
         operation: F,
-        unlock_method: UnlockMethod,
-    ) -> Result<(), Box<dyn Error>>
-    where
-        F: Fn(&mut StratPool) -> Result<(), Box<dyn Error>>,
+        unlock_method: TokenUnlockMethod,
+    ) where
+        F: FnOnce(&mut AnyPool) + UnwindSafe,
     {
-        fn needs_clean_up<F>(
-            mut engine: StratEngine,
-            uuid: PoolUuid,
-            fail_device: &FailDevice,
-            operation: F,
-        ) -> Result<(), Box<dyn Error>>
-        where
-            F: Fn(&mut StratPool) -> Result<(), Box<dyn Error>>,
-        {
-            let (_, pool) = engine
-                .get_mut_pool(uuid)
-                .ok_or_else(|| Box::new(StratisError::Msg("Pool must be present".to_string())))?;
+        unshare_mount_namespace().unwrap();
+        let (send, _recv) = unbounded_channel();
+        let engine = StratEngine::initialize(send).unwrap();
+        let uuid = test_async!(engine.create_pool_legacy(name, data_paths, Some(encryption_info)))
+            .unwrap()
+            .changed()
+            .expect("Pool should be newly created");
+        let mut pool = test_async!(engine.get_mut_pool(PoolIdentifier::Uuid(uuid)))
+            .expect("Pool must be present");
 
-            fail_device.start_failing(*Bytes(u128::from(crypt_metadata_size())).sectors())?;
-            if operation(pool).is_ok() {
-                return Err(Box::new(StratisError::Msg(
-                    "Clevis initialization should have failed".to_string(),
-                )));
-            }
-
-            if pool.avail_actions() != ActionAvailability::Full {
-                return Err(Box::new(StratisError::Msg(
-                    "Pool should have rolled back the change entirely".to_string(),
-                )));
-            }
-
-            fail_device.stop_failing()?;
-
-            engine.teardown()?;
-
-            Ok(())
+        if let Some(cds) = cache_paths {
+            pool.init_cache(uuid, name, cds, true).unwrap();
         }
 
-        let mut engine = StratEngine::initialize()?;
-        let uuid = engine
-            .create_pool(name, paths_with_fail_device, None, Some(encryption_info))?
-            .changed()
-            .ok_or_else(|| {
-                Box::new(StratisError::Msg(
-                    "Pool should be newly created".to_string(),
-                ))
-            })?;
+        fail_device
+            .start_failing(*crypt_metadata_size().sectors())
+            .unwrap();
+        assert_matches!(catch_unwind(move || operation(&mut pool)), Err(_));
 
-        let res = needs_clean_up(engine, uuid, fail_device, operation);
-        dm_stratis_devices_remove()?;
-        res?;
+        if test_async!(engine.get_pool(PoolIdentifier::Uuid(uuid)))
+            .expect("Pool must be present")
+            .avail_actions()
+            != ActionAvailability::Full
+        {
+            panic!("Pool should have rolled back the change entirely");
+        }
 
-        let mut engine = StratEngine::initialize()?;
-        engine.unlock_pool(uuid, unlock_method)?;
-        engine.destroy_pool(uuid)?;
-        engine.teardown()?;
+        fail_device.stop_failing().unwrap();
 
-        Ok(())
+        test_async!(engine.stop_pool(PoolIdentifier::Uuid(uuid), true)).unwrap();
+
+        test_async!(engine.start_pool(PoolIdentifier::Uuid(uuid), unlock_method, None, false))
+            .unwrap();
+        test_async!(engine.destroy_pool(uuid)).unwrap();
+        cmd::udev_settle().unwrap();
+        engine.teardown().unwrap();
     }
 
     /// Test the creation of a pool with Clevis bindings, keyring bind, and unlock
     /// after rollback.
     fn test_keyring_bind_rollback(paths: &[&Path]) {
-        fn test(paths: &[&Path], key_desc: &KeyDescription) -> Result<(), Box<dyn Error>> {
+        fn test(paths: &[&Path], key_desc: &KeyDescription) {
             let mut paths_with_fail_device = paths.to_vec();
-            let last_device = paths_with_fail_device.pop().ok_or_else(|| {
-                StratisError::Msg("Test requires at least one device".to_string())
-            })?;
-            let fail_device = FailDevice::new(last_device, "stratis_fail_device")?;
-            cmd::udev_settle()?;
+            let last_device = paths_with_fail_device
+                .pop()
+                .expect("Test requires at least one device");
+            let fail_device = FailDevice::new(last_device, "stratis_fail_device").unwrap();
+            cmd::udev_settle().unwrap();
             let fail_device_path = fail_device.as_path();
             paths_with_fail_device.push(&fail_device_path);
 
             let name = "pool";
-            let tang_url = env::var("TANG_URL")?;
+            let tang_url = env::var("TANG_URL").expect("TANG_URL env var required");
 
             create_pool_and_test_rollback(
                 name,
                 paths_with_fail_device.as_slice(),
+                None,
                 &fail_device,
-                &EncryptionInfo::ClevisInfo((
-                    "tang".to_string(),
-                    json!({
-                        "url": tang_url,
-                        "stratis:tang:trust_url": true
-                    }),
-                )),
+                InputEncryptionInfo::new_legacy(
+                    None,
+                    Some((
+                        "tang".to_string(),
+                        json!({
+                            "url": tang_url,
+                            "stratis:tang:trust_url": true
+                        }),
+                    )),
+                )
+                .as_ref()
+                .expect("Passed Clevis info"),
                 |pool| {
-                    pool.bind_keyring(key_desc)?;
-                    Ok(())
+                    pool.bind_keyring(
+                        &Name::new(name.to_string()),
+                        OptionalTokenSlotInput::Legacy,
+                        key_desc,
+                    )
+                    .unwrap();
                 },
-                UnlockMethod::Clevis,
-            )?;
-
-            Ok(())
+                TokenUnlockMethod::from(Some(UnlockMethod::Clevis)),
+            );
         }
 
         crypt::insert_and_cleanup_key(paths, test)
@@ -742,17 +1290,13 @@ mod test {
     /// Test the creation of a pool with a passphrase, keyring rebind, and unlock
     /// after rollback.
     fn test_keyring_rebind_rollback(paths: &[&Path]) {
-        fn test(
-            paths: &[&Path],
-            key_desc1: &KeyDescription,
-            key_desc2: &KeyDescription,
-        ) -> Result<(), Box<dyn Error>> {
+        fn test(paths: &[&Path], key_desc1: &KeyDescription, key_desc2: &KeyDescription) {
             let mut paths_with_fail_device = paths.to_vec();
-            let last_device = paths_with_fail_device.pop().ok_or_else(|| {
-                StratisError::Msg("Test requires at least one device".to_string())
-            })?;
-            let fail_device = FailDevice::new(last_device, "stratis_fail_device")?;
-            cmd::udev_settle()?;
+            let last_device = paths_with_fail_device
+                .pop()
+                .expect("Test requires at least one device");
+            let fail_device = FailDevice::new(last_device, "stratis_fail_device").unwrap();
+            cmd::udev_settle().unwrap();
             let fail_device_path = fail_device.as_path();
             paths_with_fail_device.push(&fail_device_path);
 
@@ -761,19 +1305,19 @@ mod test {
             create_pool_and_test_rollback(
                 name,
                 paths_with_fail_device.as_slice(),
+                None,
                 &fail_device,
-                &EncryptionInfo::KeyDesc(key_desc1.to_owned()),
+                InputEncryptionInfo::new_legacy(Some(key_desc1.to_owned()), None)
+                    .as_ref()
+                    .expect("Passed key description"),
                 |pool| {
-                    pool.rebind_keyring(key_desc2)?;
+                    pool.rebind_keyring(None, key_desc2).unwrap();
                     // Change the key to ensure that the second key description
                     // is not the one that causes it to unlock successfully.
-                    crypt::change_key(key_desc2)?;
-                    Ok(())
+                    crypt::change_key(key_desc2);
                 },
-                UnlockMethod::Keyring,
-            )?;
-
-            Ok(())
+                TokenUnlockMethod::from(Some(UnlockMethod::Keyring)),
+            );
         }
 
         crypt::insert_and_cleanup_two_keys(paths, test)
@@ -798,41 +1342,42 @@ mod test {
     /// Test the creation of a pool with a passphrase and Clevis bindings,
     /// keyring unbind, and unlock after rollback.
     fn test_keyring_unbind_rollback(paths: &[&Path]) {
-        fn test(paths: &[&Path], key_desc: &KeyDescription) -> Result<(), Box<dyn Error>> {
+        fn test(paths: &[&Path], key_desc: &KeyDescription) {
             let mut paths_with_fail_device = paths.to_vec();
-            let last_device = paths_with_fail_device.pop().ok_or_else(|| {
-                StratisError::Msg("Test requires at least one device".to_string())
-            })?;
-            let fail_device = FailDevice::new(last_device, "stratis_fail_device")?;
-            cmd::udev_settle()?;
+            let last_device = paths_with_fail_device
+                .pop()
+                .expect("Test requires at least one device");
+            let fail_device = FailDevice::new(last_device, "stratis_fail_device").unwrap();
+            cmd::udev_settle().unwrap();
             let fail_device_path = fail_device.as_path();
             paths_with_fail_device.push(&fail_device_path);
 
             let name = "pool";
-            let tang_url = env::var("TANG_URL")?;
+            let tang_url = env::var("TANG_URL").expect("TANG_URL env var required");
 
             create_pool_and_test_rollback(
                 name,
                 paths_with_fail_device.as_slice(),
+                None,
                 &fail_device,
-                &EncryptionInfo::Both(
-                    key_desc.to_owned(),
-                    (
+                InputEncryptionInfo::new_legacy(
+                    Some(key_desc.to_owned()),
+                    Some((
                         "tang".to_string(),
                         json!({
                             "url": tang_url,
                             "stratis:tang:trust_url": true
                         }),
-                    ),
-                ),
+                    )),
+                )
+                .as_ref()
+                .expect("Passed both key description and CLevis Info"),
                 |pool| {
-                    pool.unbind_keyring()?;
-                    Ok(())
+                    pool.unbind_keyring(&Name::new(name.to_string()), None)
+                        .unwrap();
                 },
-                UnlockMethod::Keyring,
-            )?;
-
-            Ok(())
+                TokenUnlockMethod::from(Some(UnlockMethod::Keyring)),
+            );
         }
 
         crypt::insert_and_cleanup_key(paths, test)
@@ -857,38 +1402,41 @@ mod test {
     /// Test the creation of a pool with a passphrase, Clevis bind, and unlock
     /// after rollback.
     fn test_clevis_bind_rollback(paths: &[&Path]) {
-        fn test(paths: &[&Path], key_desc: &KeyDescription) -> Result<(), Box<dyn Error>> {
+        fn test(paths: &[&Path], key_desc: &KeyDescription) {
             let mut paths_with_fail_device = paths.to_vec();
-            let last_device = paths_with_fail_device.pop().ok_or_else(|| {
-                StratisError::Msg("Test requires at least one device".to_string())
-            })?;
-            let fail_device = FailDevice::new(last_device, "stratis_fail_device")?;
-            cmd::udev_settle()?;
+            let last_device = paths_with_fail_device
+                .pop()
+                .expect("Test requires at least one device");
+            let fail_device = FailDevice::new(last_device, "stratis_fail_device").unwrap();
+            cmd::udev_settle().unwrap();
             let fail_device_path = fail_device.as_path();
             paths_with_fail_device.push(&fail_device_path);
 
             let name = "pool";
-            let tang_url = env::var("TANG_URL")?;
+            let tang_url = env::var("TANG_URL").expect("TANG_URL env var required");
 
             create_pool_and_test_rollback(
                 name,
                 paths_with_fail_device.as_slice(),
+                None,
                 &fail_device,
-                &EncryptionInfo::KeyDesc(key_desc.to_owned()),
+                InputEncryptionInfo::new_legacy(Some(key_desc.to_owned()), None)
+                    .as_ref()
+                    .expect("Passed key description"),
                 |pool| {
                     pool.bind_clevis(
+                        &Name::new(name.to_string()),
+                        OptionalTokenSlotInput::Legacy,
                         "tang",
                         &json!({
                             "url": tang_url,
                             "stratis:tang:trust_url": true
                         }),
-                    )?;
-                    Ok(())
+                    )
+                    .unwrap();
                 },
-                UnlockMethod::Keyring,
-            )?;
-
-            Ok(())
+                TokenUnlockMethod::from(Some(UnlockMethod::Keyring)),
+            );
         }
 
         crypt::insert_and_cleanup_key(paths, test)
@@ -920,26 +1468,30 @@ mod test {
         paths_with_fail_device.push(&fail_device_path);
 
         let name = "pool";
-        let tang_url = env::var("TANG_URL").unwrap();
+        let tang_url = env::var("TANG_URL").expect("TANG_URL env var required");
 
         create_pool_and_test_rollback(
             name,
             paths_with_fail_device.as_slice(),
+            None,
             &fail_device,
-            &EncryptionInfo::ClevisInfo((
-                "tang".to_string(),
-                json!({
-                    "url": tang_url,
-                    "stratis:tang:trust_url": true
-                }),
-            )),
+            InputEncryptionInfo::new_legacy(
+                None,
+                Some((
+                    "tang".to_string(),
+                    json!({
+                        "url": tang_url,
+                        "stratis:tang:trust_url": true
+                    }),
+                )),
+            )
+            .as_ref()
+            .expect("Passed Clevis info"),
             |pool| {
-                pool.rebind_clevis()?;
-                Ok(())
+                pool.rebind_clevis(None).unwrap();
             },
-            UnlockMethod::Clevis,
-        )
-        .unwrap();
+            TokenUnlockMethod::from(Some(UnlockMethod::Clevis)),
+        );
     }
 
     #[test]
@@ -961,41 +1513,42 @@ mod test {
     /// Test the creation of a pool with a passphrase and Clevis bindings,
     /// Clevis unbind, and unlock after rollback.
     fn test_clevis_unbind_rollback(paths: &[&Path]) {
-        fn test(paths: &[&Path], key_desc: &KeyDescription) -> Result<(), Box<dyn Error>> {
+        fn test(paths: &[&Path], key_desc: &KeyDescription) {
             let mut paths_with_fail_device = paths.to_vec();
-            let last_device = paths_with_fail_device.pop().ok_or_else(|| {
-                StratisError::Msg("Test requires at least one device".to_string())
-            })?;
-            let fail_device = FailDevice::new(last_device, "stratis_fail_device")?;
-            cmd::udev_settle()?;
+            let last_device = paths_with_fail_device
+                .pop()
+                .expect("Test requires at least one device");
+            let fail_device = FailDevice::new(last_device, "stratis_fail_device").unwrap();
+            cmd::udev_settle().unwrap();
             let fail_device_path = fail_device.as_path();
             paths_with_fail_device.push(&fail_device_path);
 
             let name = "pool";
-            let tang_url = env::var("TANG_URL")?;
+            let tang_url = env::var("TANG_URL").expect("TANG_URL env var required");
 
             create_pool_and_test_rollback(
                 name,
                 paths_with_fail_device.as_slice(),
+                None,
                 &fail_device,
-                &EncryptionInfo::Both(
-                    key_desc.to_owned(),
-                    (
+                InputEncryptionInfo::new_legacy(
+                    Some(key_desc.to_owned()),
+                    Some((
                         "tang".to_string(),
                         json!({
                             "url": tang_url,
                             "stratis:tang:trust_url": true
                         }),
-                    ),
-                ),
+                    )),
+                )
+                .as_ref()
+                .expect("Passed key description and Clevis info"),
                 |pool| {
-                    pool.unbind_clevis()?;
-                    Ok(())
+                    pool.unbind_clevis(&Name::new(name.to_string()), None)
+                        .unwrap();
                 },
-                UnlockMethod::Clevis,
-            )?;
-
-            Ok(())
+                TokenUnlockMethod::from(Some(UnlockMethod::Clevis)),
+            );
         }
 
         crypt::insert_and_cleanup_key(paths, test)
@@ -1015,5 +1568,106 @@ mod test {
             &real::DeviceLimits::AtLeast(2, None, None),
             test_clevis_unbind_rollback,
         );
+    }
+
+    /// Test the creation of a pool with a passphrase, keyring rebind, and unlock
+    /// after rollback.
+    fn test_keyring_rebind_with_cache_rollback(paths: &[&Path]) {
+        fn test(paths: &[&Path], key_desc1: &KeyDescription, key_desc2: &KeyDescription) {
+            let mut paths = paths.to_vec();
+            let last_device = paths.pop().expect("Test requires at least one device");
+            let fail_device = FailDevice::new(last_device, "stratis_fail_device").unwrap();
+            cmd::udev_settle().unwrap();
+            let fail_device_path = fail_device.as_path();
+            paths.push(&fail_device_path);
+            let (data, cache) = paths.split_at(1);
+
+            let name = "pool";
+
+            create_pool_and_test_rollback(
+                name,
+                data,
+                Some(cache),
+                &fail_device,
+                InputEncryptionInfo::new_legacy(Some(key_desc1.to_owned()), None)
+                    .as_ref()
+                    .expect("Passed key description"),
+                |pool| {
+                    pool.rebind_keyring(None, key_desc2).unwrap();
+                    // Change the key to ensure that the second key description
+                    // is not the one that causes it to unlock successfully.
+                    crypt::change_key(key_desc2);
+                },
+                TokenUnlockMethod::from(Some(UnlockMethod::Keyring)),
+            );
+        }
+
+        crypt::insert_and_cleanup_two_keys(paths, test)
+    }
+
+    #[test]
+    fn loop_test_keyring_rebind_with_cache_rollback() {
+        loopbacked::test_with_spec(
+            &loopbacked::DeviceLimits::Exactly(3, None),
+            test_keyring_rebind_with_cache_rollback,
+        );
+    }
+
+    #[test]
+    fn real_test_keyring_rebind_with_cache_rollback() {
+        real::test_with_spec(
+            &real::DeviceLimits::AtLeast(3, None, None),
+            test_keyring_rebind_with_cache_rollback,
+        );
+    }
+
+    /// Test creating a pool and stopping it. Check that the pool is stopped and
+    /// then restart the engine, check that it is still stopped, and then start it.
+    fn test_start_stop(paths: &[&Path]) {
+        let (send, _recv) = unbounded_channel();
+        let engine = StratEngine::initialize(send).unwrap();
+        let name = "pool_name";
+        let uuid = test_async!(engine.create_pool(name, paths, None, IntegritySpec::default()))
+            .unwrap()
+            .changed()
+            .unwrap();
+        assert!(
+            test_async!(engine.stop_pool(PoolIdentifier::Uuid(uuid), true))
+                .unwrap()
+                .is_changed()
+        );
+        assert_eq!(test_async!(engine.stopped_pools()).stopped.len(), 1);
+        assert_eq!(test_async!(engine.pools()).len(), 0);
+
+        engine.teardown().unwrap();
+
+        let (send, _recv) = unbounded_channel();
+        let engine = StratEngine::initialize(send).unwrap();
+        assert_eq!(test_async!(engine.stopped_pools()).stopped.len(), 1);
+        assert_eq!(test_async!(engine.pools()).len(), 0);
+
+        assert!(test_async!(engine.start_pool(
+            PoolIdentifier::Uuid(uuid),
+            TokenUnlockMethod::None,
+            None,
+            false
+        ))
+        .unwrap()
+        .is_changed());
+        assert_eq!(test_async!(engine.stopped_pools()).stopped.len(), 0);
+        assert_eq!(test_async!(engine.pools()).len(), 1);
+    }
+
+    #[test]
+    fn loop_test_start_stop() {
+        loopbacked::test_with_spec(
+            &loopbacked::DeviceLimits::Range(2, 3, None),
+            test_start_stop,
+        );
+    }
+
+    #[test]
+    fn real_test_start_stop() {
+        real::test_with_spec(&real::DeviceLimits::AtLeast(2, None, None), test_start_stop);
     }
 }

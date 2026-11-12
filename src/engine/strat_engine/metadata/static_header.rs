@@ -9,13 +9,15 @@ use std::{
 };
 
 use byteorder::{ByteOrder, LittleEndian};
-use crc::crc32;
+use chrono::{DateTime, Utc};
+use crc::{Crc, CRC_32_ISCSI};
 use serde_json::Value;
 
 use devicemapper::{Sectors, IEC, SECTOR_SIZE};
 
 use crate::{
     engine::{
+        shared::unsigned_to_timestamp,
         strat_engine::{
             metadata::sizes::{
                 static_header_size, BDAExtendedSize, BlockdevSize, MDADataSize, MDASize,
@@ -23,7 +25,7 @@ use crate::{
             },
             writing::SyncAll,
         },
-        types::{DevUuid, PoolUuid},
+        types::{DevUuid, PoolUuid, StratSigblockVersion},
     },
     stratis::{StratisError, StratisResult},
 };
@@ -32,12 +34,12 @@ const RESERVED_SECTORS: Sectors = Sectors(3 * IEC::Mi / (SECTOR_SIZE as u64)); /
 
 const STRAT_MAGIC: &[u8] = b"!Stra0tis\x86\xff\x02^\x41rh";
 
-const STRAT_SIGBLOCK_VERSION: u8 = 1;
+const CASTAGNOLI: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 
 /// Data structure to hold results of reading and parsing a signature buffer.
 /// Invariant: bytes is Err <-> header == None, because if there was an error
 /// reading the data then there is no point in parsing.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StaticHeaderResult {
     /// The bytes read
     pub bytes: StratisResult<Box<[u8; bytes!(static_header_size::SIGBLOCK_SECTORS)]>>,
@@ -86,7 +88,7 @@ impl fmt::Display for StratisIdentifiers {
     }
 }
 
-impl<'a> Into<Value> for &'a StratisIdentifiers {
+impl Into<Value> for &StratisIdentifiers {
     fn into(self) -> Value {
         json!({
             "pool_uuid": Value::from(self.pool_uuid.to_string()),
@@ -107,6 +109,17 @@ where
         .map(|sh| sh.map(|sh| sh.identifiers))
 }
 
+/// Get the static header from any Stratis device.
+/// If there is an error while obtaining these values return the error.
+/// If the device does not appear to be a Stratis device, return None.
+pub fn static_header<F>(f: &mut F) -> StratisResult<Option<StaticHeader>>
+where
+    F: Read + Seek + SyncAll,
+{
+    let read_results = StaticHeader::read_sigblocks(f);
+    StaticHeader::repair_sigblocks(f, read_results, StaticHeader::write_header)
+}
+
 /// Remove Stratis identifying information from device.
 pub fn disown_device<F>(f: &mut F) -> StratisResult<()>
 where
@@ -115,31 +128,34 @@ where
     StaticHeader::wipe(f)
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 pub struct StaticHeader {
     pub blkdev_size: BlockdevSize,
+    pub sigblock_version: StratSigblockVersion,
     pub identifiers: StratisIdentifiers,
     pub mda_size: MDASize,
     pub reserved_size: ReservedSize,
     pub flags: u64,
-    /// Seconds portion of DateTime<Utc> value.
-    pub initialization_time: u64,
+    pub initialization_time: DateTime<Utc>,
 }
 
 impl StaticHeader {
     pub fn new(
+        sigblock_version: StratSigblockVersion,
         identifiers: StratisIdentifiers,
         mda_data_size: MDADataSize,
         blkdev_size: BlockdevSize,
-        initialization_time: u64,
+        initialization_time: DateTime<Utc>,
     ) -> StaticHeader {
         StaticHeader {
             blkdev_size,
+            sigblock_version,
             identifiers,
             mda_size: mda_data_size.region_size().mda_size(),
             reserved_size: ReservedSize::new(RESERVED_SECTORS),
             flags: 0,
-            initialization_time,
+            initialization_time: DateTime::from_timestamp(initialization_time.timestamp(), 0)
+                .expect("DateTime::timestamp() always returns valid seconds value"),
         }
     }
 
@@ -164,12 +180,12 @@ impl StaticHeader {
         let mut buf_loc_1 = [0u8; bytes!(static_header_size::SIGBLOCK_SECTORS)];
         let mut buf_loc_2 = [0u8; bytes!(static_header_size::SIGBLOCK_SECTORS)];
 
-        fn read_sector_at_offset<F>(f: &mut F, offset: usize, mut buf: &mut [u8]) -> io::Result<()>
+        fn read_sector_at_offset<F>(f: &mut F, offset: usize, buf: &mut [u8]) -> io::Result<()>
         where
             F: Read + Seek,
         {
             f.seek(SeekFrom::Start(offset as u64))
-                .and_then(|_| f.read_exact(&mut buf))
+                .and_then(|_| f.read_exact(buf))
         }
 
         (
@@ -198,7 +214,7 @@ impl StaticHeader {
     {
         let signature_block = self.sigblock_to_buf();
         let zeroed = [0u8; bytes!(static_header_size::POST_SIGBLOCK_PADDING_SECTORS)];
-        f.seek(SeekFrom::Start(0))?;
+        f.rewind()?;
 
         // Write to a static header region in the static header.
         fn write_region<F>(f: &mut F, signature_block: &[u8], zeroed: &[u8]) -> io::Result<()>
@@ -275,12 +291,12 @@ impl StaticHeader {
         f: &mut F,
         sh: StaticHeader,
         repair_location: MetadataLocation,
-    ) -> StratisResult<Option<StaticHeader>>
+    ) -> StratisResult<StaticHeader>
     where
         F: Seek + SyncAll,
     {
         sh.write(f, repair_location)?;
-        Ok(Some(sh))
+        Ok(sh)
     }
 
     /// Replacement function for write_header
@@ -290,11 +306,11 @@ impl StaticHeader {
         _f: &mut F,
         sh: StaticHeader,
         _repair_location: MetadataLocation,
-    ) -> StratisResult<Option<StaticHeader>>
+    ) -> StratisResult<StaticHeader>
     where
         F: Seek + SyncAll,
     {
-        Ok(Some(sh))
+        Ok(sh)
     }
 
     /// Try to find a valid StaticHeader on a device.
@@ -305,7 +321,7 @@ impl StaticHeader {
     /// copies and if one validates but one does not, re-write the one that is incorrect or leave
     /// it be, depending on the closure parameter.  If both
     /// copies are valid, but one is newer than the other, rewrite the older one to match or leave
-    /// it be depending on the closure paraemter.
+    /// it be depending on the closure parameter.
     /// Return None if it's not a Stratis device.
     /// Return an error if the metadata seems to indicate that the device is
     /// a Stratis device, but no well-formed signature block could be read.
@@ -320,7 +336,7 @@ impl StaticHeader {
     ) -> StratisResult<Option<StaticHeader>>
     where
         F: Read + Seek + SyncAll,
-        C: Fn(&mut F, StaticHeader, MetadataLocation) -> StratisResult<Option<StaticHeader>>,
+        C: Fn(&mut F, StaticHeader, MetadataLocation) -> StratisResult<StaticHeader>,
     {
         // Action taken when one sigblock is interpreted as invalid.
         //
@@ -335,7 +351,7 @@ impl StaticHeader {
                                              repair_location: MetadataLocation|
          -> StratisResult<Option<StaticHeader>> {
             if let Some(sh) = maybe_sh {
-                closure(f, sh, repair_location)
+                closure(f, sh, repair_location).map(Some)
             } else {
                 Err(sh_error)
             }
@@ -357,12 +373,14 @@ impl StaticHeader {
             if sh_1 == sh_2 {
                 Ok(Some(sh_1))
             } else if sh_1.initialization_time == sh_2.initialization_time {
-                let err_str = "Appeared to be a Stratis device, but signature blocks disagree.";
-                Err(StratisError::Msg(err_str.into()))
+                let err_str = format!(
+                    "Appeared to be a Stratis device, but signature blocks {sh_1:?} and {sh_2:?} disagree"
+                );
+                Err(StratisError::Msg(err_str))
             } else if sh_1.initialization_time > sh_2.initialization_time {
-                closure(f, sh_1, MetadataLocation::Second)
+                closure(f, sh_1, MetadataLocation::Second).map(Some)
             } else {
-                closure(f, sh_2, MetadataLocation::First)
+                closure(f, sh_2, MetadataLocation::First).map(Some)
             }
         };
 
@@ -384,8 +402,8 @@ impl StaticHeader {
             match (maybe_sh1, maybe_sh2) {
                 (Some(loc_1), Some(loc_2)) => compare_headers(f, loc_1, loc_2),
                 (None, None) => Ok(None),
-                (Some(loc_1), None) => closure(f, loc_1, MetadataLocation::Second),
-                (None, Some(loc_2)) => closure(f, loc_2, MetadataLocation::First),
+                (Some(loc_1), None) => closure(f, loc_1, MetadataLocation::Second).map(Some),
+                (None, Some(loc_2)) => closure(f, loc_2, MetadataLocation::First).map(Some),
             }
         };
 
@@ -477,15 +495,17 @@ impl StaticHeader {
         let mut buf = [0u8; bytes!(static_header_size::SIGBLOCK_SECTORS)];
         buf[4..20].clone_from_slice(STRAT_MAGIC);
         LittleEndian::write_u64(&mut buf[20..28], *self.blkdev_size.sectors());
-        buf[28] = STRAT_SIGBLOCK_VERSION;
+        buf[28] = self.sigblock_version as u8;
         buf[32..64].clone_from_slice(uuid_to_string!(self.identifiers.pool_uuid).as_bytes());
         buf[64..96].clone_from_slice(uuid_to_string!(self.identifiers.device_uuid).as_bytes());
         LittleEndian::write_u64(&mut buf[96..104], *self.mda_size.sectors());
         LittleEndian::write_u64(&mut buf[104..112], *self.reserved_size.sectors());
-        LittleEndian::write_u64(&mut buf[120..128], self.initialization_time);
+        LittleEndian::write_u64(
+            &mut buf[120..128],
+            self.initialization_time.timestamp() as u64,
+        );
 
-        let hdr_crc =
-            crc32::checksum_castagnoli(&buf[4..bytes!(static_header_size::SIGBLOCK_SECTORS)]);
+        let hdr_crc = CASTAGNOLI.checksum(&buf[4..bytes!(static_header_size::SIGBLOCK_SECTORS)]);
         LittleEndian::write_u32(&mut buf[..4], hdr_crc);
         buf
     }
@@ -502,33 +522,32 @@ impl StaticHeader {
             return Ok(None);
         }
 
-        let crc = crc32::checksum_castagnoli(&buf[4..bytes!(static_header_size::SIGBLOCK_SECTORS)]);
+        let crc = CASTAGNOLI.checksum(&buf[4..bytes!(static_header_size::SIGBLOCK_SECTORS)]);
         if crc != LittleEndian::read_u32(&buf[..4]) {
             return Err(StratisError::Msg("header CRC invalid".into()));
         }
 
         let blkdev_size = BlockdevSize::new(Sectors(LittleEndian::read_u64(&buf[20..28])));
 
-        let version = buf[28];
-        if version != STRAT_SIGBLOCK_VERSION {
-            return Err(StratisError::Msg(format!(
-                "Unknown sigblock version: {}",
-                version
-            )));
-        }
+        let version_buf = buf[28];
+        let version = StratSigblockVersion::from_repr(version_buf)
+            .ok_or_else(|| StratisError::Msg(format!("Unknown sigblock version: {version_buf}")))?;
 
         let pool_uuid = PoolUuid::parse_str(from_utf8(&buf[32..64])?)?;
         let dev_uuid = DevUuid::parse_str(from_utf8(&buf[64..96])?)?;
 
         let mda_size = MDASize(Sectors(LittleEndian::read_u64(&buf[96..104])));
 
+        let initialization_time = unsigned_to_timestamp(LittleEndian::read_u64(&buf[120..128]), 0)?;
+
         Ok(Some(StaticHeader {
             identifiers: StratisIdentifiers::new(pool_uuid, dev_uuid),
             blkdev_size,
+            sigblock_version: version,
             mda_size,
             reserved_size: ReservedSize::new(Sectors(LittleEndian::read_u64(&buf[104..112]))),
             flags: 0,
-            initialization_time: LittleEndian::read_u64(&buf[120..128]),
+            initialization_time,
         }))
     }
 
@@ -538,7 +557,7 @@ impl StaticHeader {
         F: Seek + SyncAll,
     {
         let zeroed = [0u8; bytes!(static_header_size::STATIC_HEADER_SECTORS)];
-        f.seek(SeekFrom::Start(0))?;
+        f.rewind()?;
         f.write_all(&zeroed)?;
         f.sync_all()?;
         Ok(())
@@ -555,7 +574,10 @@ pub mod tests {
 
     use devicemapper::{Bytes, Sectors, IEC};
 
-    use crate::engine::strat_engine::metadata::sizes::{static_header_size, MDADataSize};
+    use crate::engine::{
+        shared::now_to_timestamp,
+        strat_engine::metadata::sizes::{static_header_size, MDADataSize},
+    };
 
     use super::*;
 
@@ -598,10 +620,11 @@ pub mod tests {
             MDADataSize::new(MDADataSize::default().bytes() + Bytes::from(mda_size_factor * 4));
         let blkdev_size = (Bytes::from(IEC::Mi) + Sectors(blkdev_size).bytes()).sectors();
         StaticHeader::new(
+            StratSigblockVersion::V1,
             StratisIdentifiers::new(pool_uuid, dev_uuid),
             mda_data_size,
             BlockdevSize::new(blkdev_size),
-            Utc::now().timestamp() as u64,
+            Utc::now(),
         )
     }
 
@@ -717,13 +740,14 @@ pub mod tests {
     fn test_rewrite_older_sigblock() {
         let sh = random_static_header(10000, 4);
 
-        let ts = Utc::now().timestamp() as u64;
+        let ts = now_to_timestamp();
         let sh_older = StaticHeader {
             initialization_time: ts,
             ..sh
         };
         let sh_newer = StaticHeader {
-            initialization_time: ts + 1,
+            initialization_time: DateTime::from_timestamp(ts.timestamp() + 1, 0)
+                .expect("DateTime::timestamp() always returns valid seconds value"),
             ..sh
         };
         assert_ne!(sh_older, sh_newer);

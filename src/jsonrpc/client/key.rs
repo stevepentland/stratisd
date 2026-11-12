@@ -8,7 +8,7 @@ use nix::unistd::{pipe, write};
 
 use crate::{
     engine::KeyDescription,
-    print_table,
+    jsonrpc::client::utils::prompt_password,
     stratis::{StratisError, StratisResult},
 };
 
@@ -19,14 +19,12 @@ pub fn key_set(key_desc: KeyDescription, keyfile_path: Option<&str>) -> StratisR
             do_request!(KeySet, key_desc; file.as_raw_fd())
         }
         None => {
-            let password =
-                rpassword::prompt_password_stdout("Enter passphrase followed by return:")?;
-            if password.is_empty() {
-                return Ok(());
-            }
+            let password = prompt_password(true)?
+                .ok_or_else(|| StratisError::Msg("Password provided was empty".to_string()))?;
+
             let (read_end, write_end) = pipe()?;
             write(write_end, password.as_bytes())?;
-            do_request!(KeySet, key_desc; read_end)
+            do_request!(KeySet, key_desc; read_end.as_raw_fd())
         }
     };
     if rc != 0 {

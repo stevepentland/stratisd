@@ -4,13 +4,11 @@
 
 use std::{
     fs::File,
-    io::Read,
     path::{Path, PathBuf},
-    thread::sleep,
-    time::Duration,
 };
 
 use nix::mount::{umount2, MntFlags};
+use retry::{delay::Fixed, retry};
 
 use devicemapper::{DevId, DmFlags, DmName, DmNameBuf, DmOptions, DM};
 
@@ -22,6 +20,8 @@ use crate::{
     },
     stratis::StratisResult,
 };
+
+pub use cleanup_errors::{Error, Result};
 
 mod cleanup_errors {
     use std::fmt;
@@ -35,6 +35,7 @@ mod cleanup_errors {
         Msg(String),
         Chained(String, Box<Error>),
         Dm(DmError),
+        Procfs(procfs::ProcError),
     }
 
     pub type Result<T> = std::result::Result<T, Error>;
@@ -63,14 +64,21 @@ mod cleanup_errors {
         }
     }
 
+    impl From<procfs::ProcError> for Error {
+        fn from(err: procfs::ProcError) -> Error {
+            Error::Procfs(err)
+        }
+    }
+
     impl fmt::Display for Error {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
-                Error::Ioe(err) => write!(f, "IO error: {}", err),
-                Error::Nix(err) => write!(f, "Nix error: {}", err),
-                Error::Msg(err) => write!(f, "{}", err),
-                Error::Chained(msg, err) => write!(f, "{}: {}", msg, err),
-                Error::Dm(err) => write!(f, "DM error: {}", err),
+                Error::Ioe(err) => write!(f, "IO error: {err}"),
+                Error::Nix(err) => write!(f, "Nix error: {err}"),
+                Error::Msg(err) => write!(f, "{err}"),
+                Error::Chained(msg, err) => write!(f, "{msg}: {err}"),
+                Error::Dm(err) => write!(f, "DM error: {err}"),
+                Error::Procfs(err) => write!(f, "Procfs error: {err}"),
             }
         }
     }
@@ -78,76 +86,58 @@ mod cleanup_errors {
     impl std::error::Error for Error {}
 }
 
-use self::cleanup_errors::{Error, Result};
-
 /// Attempt to remove all device mapper devices which match the stratis naming convention.
 /// FIXME: Current implementation complicated by https://bugzilla.redhat.com/show_bug.cgi?id=1506287
 pub fn dm_stratis_devices_remove() -> Result<()> {
     /// One iteration of removing devicemapper devices
-    fn one_iteration() -> Result<(bool, Vec<DmNameBuf>)> {
-        let mut progress_made = false;
-        let mut remain = get_dm()
+    fn one_iteration() -> Result<Vec<DmNameBuf>> {
+        #[allow(clippy::to_string_in_format_args)]
+        get_dm()
             .list_devices()
             .map_err(|e| {
                 Error::Chained(
                     "failed while listing DM devices, giving up".into(),
                     Box::new(e.into()),
                 )
-            })?
-            .iter()
-            .map(|d| &d.0)
-            .filter_map(|n| {
-                if !n.to_string().starts_with("stratis-1") {
-                    None
-                } else {
-                    match get_dm().device_remove(&DevId::Name(n), DmOptions::default()) {
-                        Ok(_) => {
-                            progress_made = true;
+            })
+            .map(|devices| {
+                devices
+                    .iter()
+                    .map(|d| &d.0)
+                    .filter_map(|n| {
+                        if !n.to_string().starts_with("stratis-1")
+                            && !n.to_string().starts_with("stratis_fail_device")
+                            && !n.to_string().starts_with("stratis_test_device")
+                        {
+                            None
+                        } else if let Err(retry::Error { error, .. }) =
+                            retry(Fixed::from_millis(1000).take(3), || {
+                                get_dm().device_remove(&DevId::Name(n), DmOptions::default())
+                            })
+                        {
+                            debug!("Failed to remove device {}: {}", n.to_string(), error);
+                            Some(n.to_owned())
+                        } else {
                             None
                         }
-                        Err(_) => Some(n.to_owned()),
-                    }
-                }
+                    })
+                    .collect::<Vec<_>>()
             })
-            .collect::<Vec<_>>();
-
-        // Retries if no progress has been made.
-        if !remain.is_empty() && !progress_made {
-            remain = remain
-                .into_iter()
-                .filter(|name| {
-                    for _ in 0..3 {
-                        match get_dm().device_remove(&DevId::Name(name), DmOptions::default()) {
-                            Ok(_) => {
-                                progress_made = true;
-                                return false;
-                            }
-                            Err(e) => {
-                                debug!(
-                                    "Failed to remove device {} on retry: {}",
-                                    name.to_string(),
-                                    e
-                                );
-                                sleep(Duration::from_secs(1));
-                            }
-                        }
-                    }
-                    true
-                })
-                .collect();
-        }
-
-        Ok((progress_made, remain))
     }
 
     /// Do one iteration of removals until progress stops. Return remaining
     /// dm devices.
     fn do_while_progress() -> Result<Vec<DmNameBuf>> {
-        let mut result = one_iteration()?;
-        while result.0 {
-            result = one_iteration()?;
+        let mut remaining = one_iteration()?;
+        while !remaining.is_empty() {
+            let temp = one_iteration()?;
+            if temp.len() < remaining.len() {
+                remaining = temp;
+            } else {
+                break;
+            }
         }
-        Ok(result.1)
+        Ok(remaining)
     }
 
     || -> Result<()> {
@@ -155,7 +145,7 @@ pub fn dm_stratis_devices_remove() -> Result<()> {
         get_dm_init().map_err(|_| Error::Msg("Unable to initialize DM".into()))?;
         do_while_progress().and_then(|remain| {
             if !remain.is_empty() {
-                Err(format!("Some Stratis DM devices remaining: {:?}", remain).into())
+                Err(format!("Some Stratis DM devices remaining: {remain:?}").into())
             } else {
                 Ok(())
             }
@@ -173,18 +163,14 @@ pub fn dm_stratis_devices_remove() -> Result<()> {
 /// immediately on the first one we are unable to unmount.
 fn stratis_filesystems_unmount() -> Result<()> {
     || -> Result<()> {
-        let mut mount_data = String::new();
-        File::open("/proc/self/mountinfo")?.read_to_string(&mut mount_data)?;
-        let parser = libmount::mountinfo::Parser::new(mount_data.as_bytes());
-
-        for mount_point in parser
-            .filter_map(|x| x.ok())
-            .filter_map(|m| m.mount_point.into_owned().into_string().ok())
-            .filter(|mp| mp.contains("stratis"))
+        for mount_point in procfs::process::Process::myself()?
+            .mountinfo()?
+            .into_iter()
+            .map(|i| i.mount_point)
+            .filter(|mp| mp.as_path().to_string_lossy().contains("stratis"))
         {
-            umount2(&PathBuf::from(mount_point), MntFlags::MNT_DETACH)?;
+            umount2(&mount_point, MntFlags::MNT_DETACH)?;
         }
-
         Ok(())
     }()
     .map_err(|e| {
@@ -267,7 +253,11 @@ impl FailDevice {
                     num_sectors_after_start,
                     self.size - num_sectors_after_start,
                     "linear".to_string(),
-                    format!("{} 0", self.backing_device.display()),
+                    format!(
+                        "{} {}",
+                        self.backing_device.display(),
+                        num_sectors_after_start
+                    ),
                 ),
             ],
             DmOptions::default(),

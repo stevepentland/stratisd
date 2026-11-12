@@ -1,0 +1,16 @@
+[Unit]
+Description=Stratis daemon
+Documentation=man:stratisd(8)
+After=remote-fs.target
+
+[Service]
+BusName=org.storage.stratis3
+Type=dbus
+Environment="RUST_BACKTRACE=1"
+ExecStart=@LIBEXECDIR@/stratisd --log-level debug
+KillSignal=SIGINT
+KillMode=process
+Restart=on-abort
+
+[Install]
+WantedBy=multi-user.target

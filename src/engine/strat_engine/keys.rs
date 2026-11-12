@@ -2,56 +2,54 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::{
-    ffi::CString,
-    fs::{create_dir_all, remove_file, set_permissions, File, OpenOptions, Permissions},
-    io::{self, Read, Write},
-    mem::size_of,
-    os::unix::{
-        fs::PermissionsExt,
-        io::{AsRawFd, RawFd},
-    },
-    path::{Path, PathBuf},
-    ptr, slice, str,
-};
+use std::{ffi::CString, fmt, io, mem::size_of, os::unix::io::RawFd, str};
 
-use libc::{syscall, SYS_add_key, SYS_keyctl};
-use nix::{
-    mount::{mount, umount, MsFlags},
-    sched::{unshare, CloneFlags},
-    sys::{
-        mman::{mmap, munmap, MapFlags, ProtFlags},
-        stat::stat,
-    },
-    unistd::{chown, gettid, Uid},
-};
-use rand::{
-    distributions::{Alphanumeric, Distribution},
-    thread_rng,
-};
+use libc::{syscall, SYS_add_key, SYS_keyctl, KEYCTL_SETPERM};
+use tokio::sync::mpsc;
 
-use libcryptsetup_rs::{SafeBorrowedMemZero, SafeMemHandle};
+use libcryptsetup_rs::SafeMemHandle;
 
 use crate::{
     engine::{
         engine::{KeyActions, MAX_STRATIS_PASS_SIZE},
-        shared,
+        shared::read_key_shared,
         strat_engine::names::KeyDescription,
-        types::{Key, MappingCreateAction, MappingDeleteAction, SizedKeyMemory},
+        types::{
+            Key, MappingCreateAction, MappingDeleteAction, SizedKeyMemory, VolumeKeyKeyDescription,
+        },
+        EngineAction,
     },
     stratis::{StratisError, StratisResult},
 };
 
-const INIT_MNT_NS_PATH: &str = "/proc/1/ns/mnt";
-
 /// A type corresponding to key IDs in the kernel keyring. In `libkeyutils`,
 /// this is represented as the C type `key_serial_t`.
-type KeySerial = u32;
+type KeySerial = i32;
 
 /// Search the persistent keyring for the given key description.
 pub(super) fn search_key_persistent(key_desc: &KeyDescription) -> StratisResult<Option<KeySerial>> {
     let keyring_id = get_persistent_keyring()?;
-    search_key(keyring_id, key_desc)
+    search_key(keyring_id, key_desc.to_system_string())
+}
+
+/// Validate that all key descriptions are in the persistent kernel keyring.
+pub fn validate_key_descs<'a>(iter: impl Iterator<Item = &'a KeyDescription>) -> StratisResult<()> {
+    for key_desc in iter {
+        search_key_persistent(key_desc)?.ok_or_else(|| {
+            StratisError::Msg(format!(
+                "Key with key description {} not found in kernel keyring",
+                key_desc.as_application_str()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Search the process keyring for the given key description.
+pub(super) fn search_key_process(
+    key_desc: &VolumeKeyKeyDescription,
+) -> StratisResult<Option<KeySerial>> {
+    search_key(libc::KEY_SPEC_PROCESS_KEYRING, key_desc.to_system_string())
 }
 
 /// Read a key from the persistent keyring with the given key description.
@@ -59,12 +57,30 @@ pub(super) fn read_key_persistent(
     key_desc: &KeyDescription,
 ) -> StratisResult<Option<(KeySerial, SizedKeyMemory)>> {
     let keyring_id = get_persistent_keyring()?;
-    read_key(keyring_id, key_desc)
+    read_key(keyring_id, key_desc.to_system_string())
+}
+
+/// Read a key from the process keyring with the given key description.
+pub(super) fn read_key_process(
+    key_desc: &VolumeKeyKeyDescription,
+) -> StratisResult<Option<(KeySerial, SizedKeyMemory)>> {
+    read_key(libc::KEY_SPEC_PROCESS_KEYRING, key_desc.to_system_string())
+}
+
+/// Unset a key from the persistent keyring with the given key description.
+pub(super) fn unset_key_process(key_desc: &VolumeKeyKeyDescription) -> StratisResult<bool> {
+    match search_key(libc::KEY_SPEC_PROCESS_KEYRING, key_desc.to_system_string())? {
+        Some(key_id) => {
+            unset_key(libc::KEY_SPEC_PROCESS_KEYRING, key_id)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 /// Get the ID of the persistent root user keyring and attach it to
 /// the session keyring.
-fn get_persistent_keyring() -> StratisResult<KeySerial> {
+pub fn get_persistent_keyring() -> StratisResult<KeySerial> {
     // Attach persistent keyring to session keyring
     match unsafe {
         syscall(
@@ -79,14 +95,30 @@ fn get_persistent_keyring() -> StratisResult<KeySerial> {
     }
 }
 
+/// Create the process keyring.
+pub fn create_process_keyring() -> StratisResult<KeySerial> {
+    // Attach persistent keyring to session keyring
+    match unsafe {
+        syscall(
+            SYS_keyctl,
+            libc::KEYCTL_GET_KEYRING_ID,
+            libc::KEY_SPEC_PROCESS_KEYRING,
+            1,
+        )
+    } {
+        i if i < 0 => Err(io::Error::last_os_error().into()),
+        i => convert_int!(i, libc::c_long, KeySerial),
+    }
+}
+
 /// Search for the given key description in the persistent root keyring.
 /// Returns the key ID or nothing if it was not found in the keyring.
-fn search_key(
-    keyring_id: KeySerial,
-    key_desc: &KeyDescription,
-) -> StratisResult<Option<KeySerial>> {
-    let key_desc_cstring = CString::new(key_desc.to_system_string())
-        .map_err(|_| StratisError::Msg("Invalid key description provided".to_string()))?;
+fn search_key(keyring_id: KeySerial, key_desc: String) -> StratisResult<Option<KeySerial>> {
+    let key_desc_cstring = CString::new(key_desc.clone()).map_err(|_| {
+        StratisError::Msg(format!(
+            "Key description {key_desc} could not be formatted as a C string"
+        ))
+    })?;
 
     let key_id = unsafe {
         syscall(
@@ -118,7 +150,7 @@ fn search_key(
 /// key description, `None` will be returned.
 fn read_key(
     keyring_id: KeySerial,
-    key_desc: &KeyDescription,
+    key_desc: String,
 ) -> StratisResult<Option<(KeySerial, SizedKeyMemory)>> {
     let key_id_option = search_key(keyring_id, key_desc)?;
     let key_id = if let Some(ki) = key_id_option {
@@ -187,7 +219,7 @@ fn set_key(
     let key_desc_cstring = CString::new(key_desc.to_system_string())
         .map_err(|_| StratisError::Msg("Invalid key description provided".to_string()))?;
     // Add a key to the kernel keyring
-    if unsafe {
+    let serial = match unsafe {
         libc::syscall(
             SYS_add_key,
             concat!("user", "\0").as_ptr(),
@@ -196,8 +228,11 @@ fn set_key(
             key_data.as_ref().len(),
             keyring_id,
         )
-    } < 0
-    {
+    } {
+        i if i < 0 => return Err(io::Error::last_os_error().into()),
+        i => i,
+    };
+    if unsafe { libc::syscall(SYS_keyctl, KEYCTL_SETPERM, serial, 0x003f_0000) } < 0 {
         Err(io::Error::last_os_error().into())
     } else {
         Ok(())
@@ -213,16 +248,16 @@ fn set_key(
 ///
 /// Successful return values:
 /// * `Ok(MappingCreateAction::Identity)`: The key was already in the keyring with the
-/// appropriate key description and key data.
+///   appropriate key description and key data.
 /// * `Ok(MappingCreateAction::Created(()))`: The key was newly added to the keyring.
 /// * `Ok(MappingCreateAction::ValueChanged(()))`: The key description was already present
-/// in the keyring but the key data was updated.
+///   in the keyring but the key data was updated.
 fn set_key_idem(
     key_desc: &KeyDescription,
     key_data: SizedKeyMemory,
 ) -> StratisResult<MappingCreateAction<Key>> {
     let keyring_id = get_persistent_keyring()?;
-    match read_key(keyring_id, key_desc) {
+    match read_key(keyring_id, key_desc.to_system_string()) {
         Ok(Some((key_id, old_key_data))) => {
             let changed = reset_key(key_id, old_key_data, key_data)?;
             if changed {
@@ -266,9 +301,7 @@ impl KeyIdList {
     }
 
     /// Populate the list with IDs from the persistent root kernel keyring.
-    fn populate(&mut self) -> StratisResult<()> {
-        let keyring_id = get_persistent_keyring()?;
-
+    fn populate(&mut self, keyring_id: KeySerial) -> StratisResult<()> {
         // Read list of keys in the persistent keyring.
         let mut done = false;
         while !done {
@@ -336,8 +369,7 @@ impl KeyIdList {
 
             if keyctl_buffer.is_empty() {
                 return Err(StratisError::Msg(format!(
-                    "Kernel key description for key {} appeared to be entirely empty",
-                    id
+                    "Kernel key description for key {id} appeared to be entirely empty"
                 )));
             }
 
@@ -349,7 +381,7 @@ impl KeyIdList {
                     )
                 })?;
             let parsed_string = parse_keyctl_describe_string(keyctl_str)?;
-            if let Some(kd) = KeyDescription::from_system_key_desc(&parsed_string).map(|k| k.expect("parse_keyctl_desribe_string() ensures the key description can not have semi-colons in it")) {
+            if let Some(kd) = KeyDescription::from_system_key_desc(&parsed_string).map(|k| k.expect("parse_keyctl_describe_string() ensures the key description can not have semi-colons in it")) {
                 key_descs.push(kd);
             }
         }
@@ -357,10 +389,8 @@ impl KeyIdList {
     }
 }
 
-/// Unset the key with ID `key_id` in the root peristent keyring.
-fn unset_key(key_id: KeySerial) -> StratisResult<()> {
-    let keyring_id = get_persistent_keyring()?;
-
+/// Unset the key with ID `key_id` in the root persistent keyring.
+fn unset_key(keyring_id: KeySerial, key_id: KeySerial) -> StratisResult<()> {
     match unsafe { syscall(SYS_keyctl, libc::KEYCTL_UNLINK, key_id, keyring_id) } {
         i if i < 0 => Err(io::Error::last_os_error().into()),
         _ => Ok(()),
@@ -368,8 +398,13 @@ fn unset_key(key_id: KeySerial) -> StratisResult<()> {
 }
 
 /// Handle for kernel keyring interaction.
-#[derive(Debug)]
-pub struct StratKeyActions;
+pub struct StratKeyActions(mpsc::UnboundedSender<KeyDescription>);
+
+impl fmt::Debug for StratKeyActions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "StratKeyActions")
+    }
+}
 
 #[cfg(test)]
 impl StratKeyActions {
@@ -386,303 +421,47 @@ impl StratKeyActions {
     }
 }
 
+impl StratKeyActions {
+    pub fn new(sender: mpsc::UnboundedSender<KeyDescription>) -> Self {
+        StratKeyActions(sender)
+    }
+}
+
 impl KeyActions for StratKeyActions {
     fn set(
-        &mut self,
+        &self,
         key_desc: &KeyDescription,
         key_fd: RawFd,
     ) -> StratisResult<MappingCreateAction<Key>> {
-        let memory = shared::set_key_shared(key_fd)?;
+        let mut memory = SafeMemHandle::alloc(MAX_STRATIS_PASS_SIZE)?;
+        let bytes = read_key_shared(key_fd, memory.as_mut())?;
 
-        set_key_idem(key_desc, memory)
+        match set_key_idem(key_desc, SizedKeyMemory::new(memory, bytes)) {
+            Ok(i) => {
+                if i.is_changed() {
+                    if let Err(e) = self.0.send(key_desc.clone()) {
+                        warn!("Failed to communicate key addition to processing thread: {e}");
+                    }
+                }
+                Ok(i)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn list(&self) -> StratisResult<Vec<KeyDescription>> {
         let mut key_ids = KeyIdList::new();
-        key_ids.populate()?;
+        key_ids.populate(get_persistent_keyring()?)?;
         key_ids.to_key_descs()
     }
 
-    fn unset(&mut self, key_desc: &KeyDescription) -> StratisResult<MappingDeleteAction<Key>> {
+    fn unset(&self, key_desc: &KeyDescription) -> StratisResult<MappingDeleteAction<Key>> {
         let keyring_id = get_persistent_keyring()?;
 
-        if let Some(key_id) = search_key(keyring_id, key_desc)? {
-            unset_key(key_id).map(|_| MappingDeleteAction::Deleted(Key))
+        if let Some(key_id) = search_key(keyring_id, key_desc.to_system_string())? {
+            unset_key(keyring_id, key_id).map(|_| MappingDeleteAction::Deleted(Key))
         } else {
             Ok(MappingDeleteAction::Identity)
-        }
-    }
-}
-
-/// A top-level tmpfs that can be made a private recursive mount so that any tmpfs
-/// mounts inside of it will not be visible to any process but stratisd.
-#[derive(Debug)]
-pub struct MemoryFilesystem;
-
-impl MemoryFilesystem {
-    pub const TMPFS_LOCATION: &'static str = "/run/stratisd/keyfiles";
-
-    pub fn new() -> StratisResult<MemoryFilesystem> {
-        let tmpfs_path = &Path::new(Self::TMPFS_LOCATION);
-        if tmpfs_path.exists() {
-            if !tmpfs_path.is_dir() {
-                return Err(StratisError::Io(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!("{} exists and is not a directory", tmpfs_path.display()),
-                )));
-            } else {
-                let stat_info = stat(Self::TMPFS_LOCATION)?;
-                let parent_path: PathBuf = vec![Self::TMPFS_LOCATION, ".."].iter().collect();
-                let parent_stat_info = stat(&parent_path)?;
-                if stat_info.st_dev != parent_stat_info.st_dev {
-                    info!("Mount found at {}; unmounting", Self::TMPFS_LOCATION);
-                    if let Err(e) = umount(Self::TMPFS_LOCATION) {
-                        warn!(
-                            "Failed to unmount filesystem at {}: {}",
-                            Self::TMPFS_LOCATION,
-                            e
-                        );
-                    }
-                }
-            }
-        } else {
-            create_dir_all(Self::TMPFS_LOCATION)?;
-        };
-        mount(
-            Some("tmpfs"),
-            Self::TMPFS_LOCATION,
-            Some("tmpfs"),
-            MsFlags::empty(),
-            Some("size=1M"),
-        )?;
-
-        mount::<str, str, str, str>(
-            None,
-            MemoryFilesystem::TMPFS_LOCATION,
-            None,
-            MsFlags::MS_SLAVE | MsFlags::MS_REC,
-            None,
-        )?;
-        Ok(MemoryFilesystem)
-    }
-}
-
-impl Drop for MemoryFilesystem {
-    fn drop(&mut self) {
-        if let Err(e) = umount(Self::TMPFS_LOCATION) {
-            warn!(
-                "Could not unmount temporary in memory storage for Clevis keyfiles: {}",
-                e
-            );
-        }
-    }
-}
-
-/// Check if the stratisd mount namespace for this thread is in the root namespace.
-fn is_in_root_namespace() -> StratisResult<bool> {
-    let pid_one_stat = stat(INIT_MNT_NS_PATH)?;
-    let self_stat = stat(format!("/proc/self/task/{}/ns/mnt", gettid()).as_str())?;
-    Ok(pid_one_stat.st_ino == self_stat.st_ino)
-}
-
-/// An in-memory filesystem that mounts a tmpfs that can house keyfiles so that they
-/// are never writen to disk. The interface aims to keep the keys in memory for as
-/// short of a period of time as possible (only for the duration of the operation
-/// that the keyfile is needed for).
-pub struct MemoryPrivateFilesystem(PathBuf);
-
-impl MemoryPrivateFilesystem {
-    pub fn new() -> StratisResult<MemoryPrivateFilesystem> {
-        let tmpfs_path = &Path::new(MemoryFilesystem::TMPFS_LOCATION);
-        if tmpfs_path.exists() {
-            if !tmpfs_path.is_dir() {
-                return Err(StratisError::Io(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!("{} exists and is not a directory", tmpfs_path.display()),
-                )));
-            } else {
-                let stat_info = stat(MemoryFilesystem::TMPFS_LOCATION)?;
-                let parent_path: PathBuf = vec![MemoryFilesystem::TMPFS_LOCATION, ".."]
-                    .iter()
-                    .collect();
-                let parent_stat_info = stat(&parent_path)?;
-                if stat_info.st_dev == parent_stat_info.st_dev {
-                    return Err(StratisError::Io(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!(
-                            "No mount found at {} which is required to proceed",
-                            tmpfs_path.display(),
-                        ),
-                    )));
-                }
-            }
-        } else {
-            return Err(StratisError::Io(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Path {} does not exist", MemoryFilesystem::TMPFS_LOCATION,),
-            )));
-        };
-        let random_string = Alphanumeric
-            .sample_iter(thread_rng())
-            .take(16)
-            .map(char::from)
-            .collect::<String>();
-        let private_fs_path = vec![MemoryFilesystem::TMPFS_LOCATION, &random_string]
-            .iter()
-            .collect();
-        create_dir_all(&private_fs_path)?;
-
-        // Only create a new mount namespace if the thread is in the root namespace.
-        if is_in_root_namespace()? {
-            unshare(CloneFlags::CLONE_NEWNS)?;
-        }
-        // Check that the namespace is now different.
-        if is_in_root_namespace()? {
-            return Err(StratisError::Msg(
-                "It was detected that the in-memory key files would have ended up \
-                visible on the host system; aborting operation prior to generating \
-                in memory key file"
-                    .to_string(),
-            ));
-        }
-
-        // Ensure that the original tmpfs mount point is private. This will work
-        // even if someone mounts their own volume at this mount point as the
-        // mount only needs to be private, it does not need to be tmpfs.
-        // The mount directly after this one will also be a tmpfs meaning that
-        // no keys will be written to disk even if this mount turns out to be
-        // a physical device.
-        mount::<str, str, str, str>(
-            None,
-            MemoryFilesystem::TMPFS_LOCATION,
-            None,
-            MsFlags::MS_SLAVE | MsFlags::MS_REC,
-            None,
-        )?;
-        mount(
-            Some("tmpfs"),
-            &private_fs_path,
-            Some("tmpfs"),
-            MsFlags::empty(),
-            Some("size=1M"),
-        )?;
-        Ok(MemoryPrivateFilesystem(private_fs_path))
-    }
-
-    pub fn key_op<F>(&self, key_desc: &KeyDescription, mut f: F) -> StratisResult<()>
-    where
-        F: FnMut(&Path) -> StratisResult<()>,
-    {
-        let persistent_id = get_persistent_keyring()?;
-        let key_data = if let Some((_, mem)) = read_key(persistent_id, key_desc)? {
-            mem
-        } else {
-            return Err(StratisError::Io(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "Key with given key description {} was not found",
-                    key_desc.as_application_str()
-                ),
-            )));
-        };
-        let mut mem_file_path = PathBuf::from(&self.0);
-        mem_file_path.push(key_desc.as_application_str());
-        let mem_file = MemoryMappedKeyfile::new(&mem_file_path, key_data)?;
-        f(mem_file.keyfile_path())
-    }
-
-    pub fn rand_key(&self) -> StratisResult<MemoryMappedKeyfile> {
-        let mut key_data = SafeMemHandle::alloc(MAX_STRATIS_PASS_SIZE)?;
-        File::open("/dev/urandom")?.read_exact(key_data.as_mut())?;
-        let mut mem_file_path = PathBuf::from(&self.0);
-        mem_file_path.push(
-            Alphanumeric
-                .sample_iter(thread_rng())
-                .take(10)
-                .map(char::from)
-                .collect::<String>(),
-        );
-        MemoryMappedKeyfile::new(
-            &mem_file_path,
-            SizedKeyMemory::new(key_data, MAX_STRATIS_PASS_SIZE),
-        )
-    }
-}
-
-impl Drop for MemoryPrivateFilesystem {
-    fn drop(&mut self) {
-        if let Err(e) = umount(&self.0) {
-            warn!(
-                "Could not unmount temporary in memory storage for Clevis keyfiles: {}",
-                e
-            );
-        }
-    }
-}
-
-/// Keyfile integration with Clevis for keys so that they are never written to disk.
-/// This struct will handle memory mapping and locking internally to avoid disk usage.
-pub struct MemoryMappedKeyfile(*mut libc::c_void, usize, PathBuf);
-
-impl MemoryMappedKeyfile {
-    pub fn new(file_path: &Path, key_data: SizedKeyMemory) -> StratisResult<MemoryMappedKeyfile> {
-        if file_path.exists() {
-            return Err(StratisError::Io(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "Keyfile is already present",
-            )));
-        }
-
-        let keyfile = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(file_path)?;
-        assert!(Uid::current().is_root());
-        chown(file_path, Some(Uid::current()), None)?;
-        set_permissions(file_path, Permissions::from_mode(0o600))?;
-        let needed_keyfile_length = key_data.as_ref().len();
-        keyfile.set_len(convert_int!(needed_keyfile_length, usize, u64)?)?;
-        let mem = unsafe {
-            mmap(
-                ptr::null_mut(),
-                needed_keyfile_length,
-                ProtFlags::PROT_WRITE,
-                MapFlags::MAP_SHARED | MapFlags::MAP_LOCKED,
-                keyfile.as_raw_fd(),
-                0,
-            )
-        }?;
-        let mut slice = unsafe { slice::from_raw_parts_mut(mem as *mut u8, needed_keyfile_length) };
-        slice.write_all(key_data.as_ref())?;
-        Ok(MemoryMappedKeyfile(
-            mem,
-            needed_keyfile_length,
-            file_path.to_owned(),
-        ))
-    }
-
-    pub fn keyfile_path(&self) -> &Path {
-        &self.2
-    }
-}
-
-impl AsRef<[u8]> for MemoryMappedKeyfile {
-    fn as_ref(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.0 as *const u8, self.1) }
-    }
-}
-
-impl Drop for MemoryMappedKeyfile {
-    fn drop(&mut self) {
-        {
-            unsafe { SafeBorrowedMemZero::from_ptr(self.0, self.1) };
-        }
-        if let Err(e) = unsafe { munmap(self.0, self.1) } {
-            warn!("Could not unmap temporary keyfile: {}", e);
-        }
-        if let Err(e) = remove_file(self.keyfile_path()) {
-            warn!("Failed to clean up temporary key file: {}", e);
         }
     }
 }

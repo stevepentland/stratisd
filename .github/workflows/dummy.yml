@@ -1,7 +1,6 @@
 ---
 name: stratisd dummy CI
 
-# yamllint disable-line rule:truthy
 on:
   push:
     branches:
@@ -12,9 +11,14 @@ on:
 
   workflow_dispatch:
 
+# cancel the in-progress workflow when PR is refreshed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
+  cancel-in-progress: true
+
 jobs:
   dummy:
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Run dummy test
         run: echo "I exist to be Required in Github branch protection rules"

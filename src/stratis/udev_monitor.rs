@@ -4,7 +4,7 @@
 
 //! Support for monitoring udev events.
 
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd};
 
 use libudev::Event;
 use nix::poll::{poll, PollFd, PollFlags};
@@ -12,6 +12,7 @@ use tokio::{
     sync::{
         broadcast::{error::TryRecvError, Receiver},
         mpsc::UnboundedSender,
+        oneshot,
     },
     task::spawn_blocking,
 };
@@ -23,18 +24,25 @@ use crate::{
 
 // Poll for udev events.
 // Check for exit condition and return if true.
+// Signals on ready once the monitor is listening. If setup fails, ready is
+// dropped without a signal so that the receiver observes the failure.
 pub async fn udev_thread(
     sender: UnboundedSender<UdevEngineEvent>,
+    ready: oneshot::Sender<()>,
     mut should_exit: Receiver<()>,
 ) -> StratisResult<()> {
     spawn_blocking(move || {
         let context = libudev::Context::new()?;
         let mut udev = UdevMonitor::create(&context)?;
 
+        // The receiver is gone only if the engine already failed to start,
+        // in which case the error is reported there.
+        let _ = ready.send(());
 
-        let mut pollers = [PollFd::new(udev.as_raw_fd(), PollFlags::POLLIN)];
         loop {
-            match poll(&mut pollers, 100)? {
+            let mut pollers = [PollFd::new(udev.as_fd(), PollFlags::POLLIN)];
+
+            match poll(&mut pollers, 100u8)? {
                 0 => {
                     match should_exit.try_recv() {
                         Ok(()) => {
@@ -53,9 +61,8 @@ pub async fn udev_thread(
                     if let Some(ref e) = udev.poll() {
                         if let Err(e) = sender.send(UdevEngineEvent::from(e)) {
                             warn!(
-                                "udev event could not be sent to engine thread: {}; the \
+                                "udev event could not be sent to engine thread: {e}; the \
                                 engine was not notified of this udev event",
-                                e,
                             );
                         }
                     }
@@ -69,12 +76,12 @@ pub async fn udev_thread(
 
 /// A facility for listening for and handling udev events that stratisd
 /// considers interesting.
-struct UdevMonitor<'a> {
-    socket: libudev::MonitorSocket<'a>,
+struct UdevMonitor {
+    socket: libudev::MonitorSocket,
 }
 
-impl<'a> UdevMonitor<'a> {
-    fn create(context: &'a libudev::Context) -> StratisResult<UdevMonitor<'a>> {
+impl UdevMonitor {
+    fn create(context: &libudev::Context) -> StratisResult<UdevMonitor> {
         let mut monitor = libudev::Monitor::new(context)?;
         monitor.match_subsystem("block")?;
 
@@ -83,13 +90,13 @@ impl<'a> UdevMonitor<'a> {
         Ok(UdevMonitor { socket })
     }
 
-    pub fn poll(&mut self) -> Option<Event<'a>> {
+    pub fn poll(&mut self) -> Option<Event> {
         self.socket.receive_event()
     }
 }
 
-impl<'a> AsRawFd for UdevMonitor<'a> {
-    fn as_raw_fd(&self) -> RawFd {
-        self.socket.as_raw_fd()
+impl AsFd for UdevMonitor {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        unsafe { BorrowedFd::borrow_raw(self.socket.as_raw_fd()) }
     }
 }

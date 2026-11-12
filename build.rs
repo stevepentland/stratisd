@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
 #[cfg(feature = "systemd_compat")]
 use std::{env, path::PathBuf};
 
@@ -7,26 +11,28 @@ use pkg_config::Config;
 
 fn main() {
     if let Err(e) = Config::new().atleast_version("2.3.0").find("libcryptsetup") {
-        panic!(
-            "At least version 2.3.0 of cryptsetup is required to compile stratisd: {}",
-            e
-        );
+        panic!("At least version 2.3.0 of cryptsetup is required to compile stratisd: {e}");
     }
 
     if let Err(e) = Config::new().atleast_version("2.32.0").find("blkid") {
-        panic!(
-            "At least version 2.32.0 of blkid is required to compile stratisd: {}",
-            e
-        );
+        panic!("At least version 2.32.0 of blkid is required to compile stratisd: {e}");
     }
 
     #[cfg(feature = "systemd_compat")]
     {
         let bindings = Builder::default()
+            .rust_target(
+                env!("CARGO_PKG_RUST_VERSION")
+                    .parse()
+                    .expect("valid rust version"),
+            )
             .header_contents(
                 "systemd-header.h",
                 "#include <systemd/sd-daemon.h>\n#include <systemd/sd-journal.h>",
             )
+            .allowlist_function("sd_notify")
+            .allowlist_function("syslog")
+            .wrap_unsafe_ops(true)
             .generate()
             .expect("Could not generate bindings for systemd");
 

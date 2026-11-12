@@ -2,11 +2,19 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use crate::{jsonrpc::client::utils::to_suffix_repr, stratis::StratisResult};
+use crate::{
+    jsonrpc::client::utils::to_suffix_repr,
+    stratis::{StratisError, StratisResult},
+};
 
 // stratis-min filesystem create
-pub fn filesystem_create(pool_name: String, filesystem_name: String) -> StratisResult<()> {
-    do_request_standard!(FsCreate, pool_name, filesystem_name)
+pub fn filesystem_create(
+    pool_name: String,
+    filesystem_name: String,
+    size: Option<u128>,
+    size_limit: Option<u128>,
+) -> StratisResult<()> {
+    do_request_standard!(FsCreate, pool_name, filesystem_name, size, size_limit)
 }
 
 // stratis-min filesystem [list]
@@ -21,10 +29,7 @@ pub fn filesystem_list() -> StratisResult<()> {
         })
         .collect();
     let devices_formatted: Vec<_> = paths.into_iter().map(|p| p.display().to_string()).collect();
-    let uuids_formatted: Vec<_> = uuids
-        .into_iter()
-        .map(|u| u.to_simple_ref().to_string())
-        .collect();
+    let uuids_formatted: Vec<_> = uuids.into_iter().map(|u| u.to_string()).collect();
     print_table!(
         "Pool Name", pool_names, "<";
         "Name", fs_names, "<";
@@ -48,4 +53,23 @@ pub fn filesystem_rename(
     new_filesystem_name: String,
 ) -> StratisResult<()> {
     do_request_standard!(FsRename, pool_name, filesystem_name, new_filesystem_name)
+}
+
+// stratis-min filesystem origin
+pub fn filesystem_origin(pool_name: String, filesystem_name: String) -> StratisResult<String> {
+    let (origin, rc, rs) = do_request!(FsOrigin, pool_name, filesystem_name);
+    if rc != 0 {
+        Err(StratisError::Msg(rs))
+    } else {
+        Ok(origin.unwrap_or_else(|| "None".to_string()))
+    }
+}
+
+// stratis-min filesystem set-size-limit
+pub fn filesystem_set_size_limit(
+    pool_name: String,
+    filesystem_name: String,
+    size_limit: u128,
+) -> StratisResult<()> {
+    do_request_standard!(FsSetSizeLimit, pool_name, filesystem_name, size_limit)
 }

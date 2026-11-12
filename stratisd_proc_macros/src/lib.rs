@@ -8,34 +8,34 @@ use proc_macro::TokenStream;
 use proc_macro2::{Group, Span, TokenStream as TokenStream2, TokenTree};
 use quote::quote;
 use syn::{
-    parse, parse_str, punctuated::Punctuated, token::Comma, Attribute, Block, FnArg, Ident,
-    ImplItem, ImplItemMethod, Item, Lit, Meta, MetaList, NestedMeta, Pat, PatIdent, PatType, Path,
-    PathSegment, Receiver, ReturnType, Stmt, Token, Type, TypePath,
+    parse, punctuated::Punctuated, token::Comma, Attribute, Block, FnArg, Ident, ImplItem,
+    ImplItemFn, Item, LitStr, Pat, PatIdent, PatType, Path, PathSegment, Receiver, ReturnType,
+    Stmt, Token, Type, TypePath,
 };
 
 /// Add guard for mutating actions when the pool is in maintenance mode.
 ///
 /// This method adds a statement that returns an error if the pool is set
 /// to limit available actions.
-fn add_method_guards(method: &mut ImplItemMethod, level: Ident) {
+fn add_method_guards(method: &mut ImplItemFn, level: Ident) {
     let stmt = if let ReturnType::Type(_, ty) = &method.sig.output {
         if let Type::Path(TypePath {
             path: Path { segments, .. },
             ..
         }) = &**ty
         {
-            if let Some(PathSegment { ident, .. }) = segments.iter().last() {
+            if let Some(PathSegment { ident, .. }) = segments.iter().next_back() {
                 if &ident.to_string() == "StratisResult" {
                     parse::<Stmt>(TokenStream::from(quote! {
                         if self.action_avail >= crate::engine::types::ActionAvailability::#level {
-                            return Err(crate::stratis::StratisError::Msg(format!(
-                                "Pool is in state {:?} where mutable actions cannot be performed until the issue is resolved manually",
-                                self.action_avail
-                            )));
+                            return Err(crate::stratis::StratisError::ActionDisabled(
+                                self.action_avail.clone()
+                            ));
                         }
-                    })).expect("This block should be a valid statement")
+                    }))
+                    .expect("This block should be a valid statement")
                 } else {
-                    panic!("The only return type currently supported for mutable actions is StratisResult<_>; found return type {} for method {}", ident.to_string(), method.sig.ident);
+                    panic!("The only return type currently supported for mutable actions is StratisResult<_>; found return type {} for method {}", ident, method.sig.ident);
                 }
             } else {
                 unreachable!();
@@ -61,7 +61,7 @@ fn add_method_guards(method: &mut ImplItemMethod, level: Ident) {
 /// Process the arguments in the argument list. There is special handling for
 /// receivers. Typed `self` parameters are not currently supported in this macro
 /// but support can be added if needed.
-fn process_arguments(fn_arg: &FnArg) -> (Ident, PatType) {
+fn process_arguments(fn_arg: &FnArg) -> Option<(Ident, PatType)> {
     match fn_arg {
         FnArg::Receiver(Receiver {
             reference,
@@ -75,7 +75,7 @@ fn process_arguments(fn_arg: &FnArg) -> (Ident, PatType) {
             let self_ident = Ident::new("self", Span::call_site());
             let pool_ident = Ident::new("pool", Span::call_site());
 
-            (
+            Some((
                 self_ident,
                 PatType {
                     attrs: Vec::new(),
@@ -89,25 +89,25 @@ fn process_arguments(fn_arg: &FnArg) -> (Ident, PatType) {
                     colon_token: Token![:](Span::call_site()),
                     ty: Box::new(
                         parse::<Type>(TokenStream::from(quote! {
-                            #reference #mutability crate::engine::strat_engine::pool::StratPool
+                            #reference #mutability StratPool
                         }))
                         .expect("Valid type"),
                     ),
                 },
-            )
+            ))
         }
         FnArg::Typed(typed) => {
-            let ident = if let Pat::Ident(PatIdent { ref ident, .. }) = *typed.pat {
+            if let Pat::Ident(PatIdent { ref ident, .. }) = *typed.pat {
                 if *ident == "self" {
                     panic!("Typed self parameters are not currently supported");
                 } else {
-                    ident.clone()
+                    Some((ident.clone(), typed.clone()))
                 }
+            } else if matches!(&*typed.pat, Pat::Wild(_)) {
+                None
             } else {
                 panic!("Unrecognized argument format");
-            };
-
-            (ident, typed.clone())
+            }
         }
     }
 }
@@ -136,7 +136,7 @@ fn process_token_stream(token: TokenTree) -> TokenTree {
 
 /// Take the body of the method and wrap it in an inner method, replacing the
 /// body with a check for an error that limits available actions.
-fn wrap_method(f: &mut ImplItemMethod) {
+fn wrap_method(f: &mut ImplItemFn) {
     let wrapped_ident = Ident::new(
         format!("{}_wrapped", f.sig.ident.clone()).as_str(),
         Span::call_site(),
@@ -144,7 +144,7 @@ fn wrap_method(f: &mut ImplItemMethod) {
     let mut wrapped_sig = f.sig.clone();
     wrapped_sig.ident = wrapped_ident.clone();
 
-    let (args, arg_idents) = f.sig.inputs.iter().map(process_arguments).fold(
+    let (args, arg_idents) = f.sig.inputs.iter().filter_map(process_arguments).fold(
         (Vec::new(), Vec::new()),
         |(mut args, mut arg_idents), (ident, arg)| {
             args.push(arg);
@@ -152,7 +152,7 @@ fn wrap_method(f: &mut ImplItemMethod) {
             (args, arg_idents)
         },
     );
-    let stmts = f.block.stmts.drain(..).collect::<Vec<_>>();
+    let stmts = &f.block.stmts;
 
     wrapped_sig.inputs = args
         .into_iter()
@@ -190,62 +190,52 @@ fn wrap_method(f: &mut ImplItemMethod) {
         .expect("Could not parse generated method body as a block");
 }
 
-/// Get the pool available action state level at which a pool operation ceases to be
-/// accepted.
+/// Get the pool available action state level at which a pool operation ceases
+/// to be accepted. Panic if there is more than one pool_mutating_action
+/// specified.
 fn get_attr_level(attrs: &mut Vec<Attribute>) -> Option<Ident> {
-    let mut return_value = None;
-    let mut index = None;
-    for (i, attr) in attrs.iter().enumerate() {
-        if let Meta::List(MetaList {
-            ref path,
-            ref nested,
-            ..
-        }) = attr
-            .parse_meta()
-            .unwrap_or_else(|_| panic!("Attribute {:?} cannot be parsed", attr))
-        {
-            if path
-                == &parse_str("pool_mutating_action").expect("pool_mutating_action is valid path")
-            {
-                for nested_meta in nested.iter() {
-                    if let NestedMeta::Lit(Lit::Str(litstr)) = nested_meta {
-                        index = Some(i);
-                        return_value =
-                            Some(parse_str::<Ident>(&litstr.value()).unwrap_or_else(|_| {
-                                panic!("{} is not a valid identifier", litstr.value())
-                            }));
-                    } else {
-                        panic!("pool_mutating_action attribute must be in form #[pool_mutating_action(\"REJECTION LEVEL\")]");
-                    }
-                }
+    let matching_attrs = attrs
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.path().is_ident("pool_mutating_action"))
+        .map(|(i, a)| {
+            if let Ok(level) = a.parse_args::<LitStr>() {
+                (i, level.parse::<Ident>().unwrap_or_else(|_| {panic!("{} is expected to be a valid identifier", level.value())}))
+            } else {
+                panic!("pool_mutating_action attribute must be in form #[pool_mutating_action(\"REJECTION LEVEL\")]")
             }
+        }).collect::<Vec<_>>();
+
+    match matching_attrs.len() {
+        0 => None,
+        1 => {
+            let (index, return_value) = &matching_attrs[0];
+            attrs.remove(*index);
+            Some(return_value.clone())
         }
+        _ => panic!(
+            "More than 1 pool_mutating_action arguments specified; ambiguous request can not be satisfied."
+        ),
     }
-    if let Some(i) = index {
-        attrs.remove(i);
-    }
-    return_value
 }
 
 /// Determine whether a method has the given attribute.
 fn has_attribute(attrs: &mut Vec<Attribute>, attribute: &str) -> bool {
-    let mut return_value = false;
-    let mut index = None;
-    for (i, attr) in attrs.iter().enumerate() {
-        if let Meta::Path(path) = attr
-            .parse_meta()
-            .unwrap_or_else(|_| panic!("Attribute {:?} cannot be parsed", attr))
-        {
-            if path == parse_str(attribute).expect("pool_mutating_action is valid path") {
-                index = Some(i);
-                return_value = true;
-            }
+    let matching_attrs = attrs
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.path().is_ident(attribute))
+        .collect::<Vec<_>>();
+
+    match matching_attrs.len() {
+        0 => false,
+        1 => {
+            let (index, _) = matching_attrs[0];
+            attrs.remove(index);
+            true
         }
+        _ => panic!("More than 1 {attribute} attribute specified for the same syntactic entity."),
     }
-    if let Some(i) = index {
-        attrs.remove(i);
-    }
-    return_value
 }
 
 /// Determine whether a method should be marked as needing to handle failed rollback
@@ -265,7 +255,7 @@ fn process_item(mut item: Item) -> Item {
     };
 
     for impl_item in i.items.iter_mut() {
-        if let ImplItem::Method(ref mut f) = impl_item {
+        if let ImplItem::Fn(f) = impl_item {
             if let Some(level) = get_attr_level(&mut f.attrs) {
                 add_method_guards(f, level);
             }
@@ -283,7 +273,7 @@ fn process_item(mut item: Item) -> Item {
 /// implementations. It provides two facilities:
 /// * checking if the error returned should cause the pool to refuse mutating actions.
 /// * returning an error if the method called would cause a mutating action to occur if
-/// the pool cannot accept mutating actions.
+///   the pool cannot accept mutating actions.
 ///
 /// This macro should be applied to `impl` items only.
 #[proc_macro_attribute]

@@ -15,18 +15,16 @@
 Used to test behavior of the udev device discovery mechanism.
 """
 
-# isort: STDLIB
+import logging
 import random
-from os import environ
-from unittest import skipIf
 
-# isort: LOCAL
 from stratisd_client_dbus import Manager, Pool, StratisdErrors, get_object
 from stratisd_client_dbus._constants import TOP_OBJECT
-from stratisd_client_dbus._stratisd_constants import EncryptionMethod
 
-from ._loopback import UDEV_ADD_EVENT
+from ._dm import remove_stratis_setup
+from ._loopback import UDEV_ADD_EVENT, UDEV_REMOVE_EVENT
 from ._utils import (
+    _LEGACY_POOL,
     CRYPTO_LUKS_FS_TYPE,
     STRATIS_FS_TYPE,
     OptionalKeyServiceContextManager,
@@ -35,11 +33,12 @@ from ._utils import (
     create_pool,
     get_devnodes,
     random_string,
-    remove_stratis_dm_devices,
     settle,
     wait_for_udev,
     wait_for_udev_count,
 )
+
+logging.basicConfig(level=logging.INFO)
 
 
 class UdevTest1(UdevTest):
@@ -81,7 +80,7 @@ class UdevTest1(UdevTest):
                 create_pool(pool_name, self._lb_mgr.device_files(device_tokens))
                 pool_data[pool_name] = device_tokens
 
-        remove_stratis_dm_devices()
+        remove_stratis_setup()
 
         all_tokens = [
             dev for device_tokens in pool_data.values() for dev in device_tokens
@@ -93,7 +92,7 @@ class UdevTest1(UdevTest):
         with ServiceContextManager():
             self.wait_for_pools(number_of_pools)
 
-        remove_stratis_dm_devices()
+        remove_stratis_setup()
 
         self._lb_mgr.unplug(all_tokens)
 
@@ -125,8 +124,6 @@ class UdevTest1(UdevTest):
 
             for name in pool_data:
                 self.wait_for_pools(1, name=name)
-
-        remove_stratis_dm_devices()
 
     def test_generic(self):
         """
@@ -172,12 +169,12 @@ class UdevTest2(UdevTest):
             self.assertEqual(len(device_object_paths), len(devnodes))
             wait_for_udev(STRATIS_FS_TYPE, get_devnodes(device_object_paths))
 
-        remove_stratis_dm_devices()
+        remove_stratis_setup()
 
         with ServiceContextManager():
             self.wait_for_pools(1)
 
-        remove_stratis_dm_devices()
+        remove_stratis_setup()
 
         self._lb_mgr.unplug(device_tokens)
 
@@ -200,8 +197,6 @@ class UdevTest2(UdevTest):
             settle()
 
             self.wait_for_pools(1)
-
-        remove_stratis_dm_devices()
 
     def test_simultaneous(self):
         """
@@ -228,9 +223,7 @@ class UdevTest3(UdevTest):
     daemon, brings it up again, and allows it to discover the existing pool.
     """
 
-    def _simple_initial_discovery_test(
-        self, *, key_spec=None, take_down_dm=False
-    ):  # pylint: disable=too-many-locals
+    def _simple_initial_discovery_test(self, *, key_spec=None, take_down_dm=False):
         """
         A simple test of discovery on start up.
 
@@ -254,38 +247,53 @@ class UdevTest3(UdevTest):
 
             self.wait_for_pools(0)
             (_, (pool_object_path, device_object_paths)) = create_pool(
-                random_string(5), devnodes, key_description=key_description
+                random_string(5),
+                devnodes,
+                key_description=(
+                    [(key_description, None)] if key_description is not None else None
+                ),
             )
+            wait_for_udev(STRATIS_FS_TYPE, get_devnodes(device_object_paths))
+            self.wait_for_pools(1)
             pool_uuid = Pool.Properties.Uuid.Get(get_object(pool_object_path))
 
-            self.wait_for_pools(1)
-
-            wait_for_udev(STRATIS_FS_TYPE, get_devnodes(device_object_paths))
-
         if take_down_dm:
-            remove_stratis_dm_devices()
+            remove_stratis_setup()
 
         with OptionalKeyServiceContextManager(key_spec=key_spec):
-            ((option, unlock_uuids), exit_code, _) = Manager.Methods.UnlockPool(
-                get_object(TOP_OBJECT),
-                {
-                    "pool_uuid": pool_uuid,
-                    "unlock_method": str(EncryptionMethod.KEYRING),
-                },
-            )
+            if _LEGACY_POOL is not None:
+                ((changed, _), exit_code, message) = Manager.Methods.StartPool(
+                    get_object(TOP_OBJECT),
+                    {
+                        "id": pool_uuid,
+                        "unlock_method": (True, (True, 1)),
+                        "id_type": "uuid",
+                        "key_fd": (False, 0),
+                        "remove_cache": False,
+                    },
+                )
+            else:
+                ((changed, _), exit_code, message) = Manager.Methods.StartPool(
+                    get_object(TOP_OBJECT),
+                    {
+                        "id": pool_uuid,
+                        "unlock_method": (True, (False, 0)),
+                        "id_type": "uuid",
+                        "key_fd": (False, 0),
+                        "remove_cache": False,
+                    },
+                )
+
             if key_spec is None:
                 self.assertNotEqual(exit_code, StratisdErrors.OK)
-                self.assertEqual(option, False)
+                self.assertEqual(changed, False)
             else:
-                self.assertEqual(exit_code, StratisdErrors.OK)
-                self.assertEqual(option, take_down_dm)
-                self.assertEqual(len(unlock_uuids), num_devices if take_down_dm else 0)
+                self.assertEqual(exit_code, StratisdErrors.OK, msg=message)
+                self.assertEqual(changed, take_down_dm)
 
             wait_for_udev_count(num_devices)
 
             self.wait_for_pools(1)
-
-        remove_stratis_dm_devices()
 
     def test_encryption_simple_initial_discovery(self):
         """
@@ -319,7 +327,7 @@ class UdevTest4(UdevTest):
     in, and it is verified that the daemon has recreated the pool.
     """
 
-    def _simple_event_test(self, *, key_spec=None):  # pylint: disable=too-many-locals
+    def _simple_event_test(self, *, key_spec=None):
         """
         A simple test of event-based discovery.
 
@@ -335,7 +343,11 @@ class UdevTest4(UdevTest):
         :type key_spec: (str, bytes) or NoneType
         """
         num_devices = 3
-        udev_wait_type = STRATIS_FS_TYPE if key_spec is None else CRYPTO_LUKS_FS_TYPE
+        udev_wait_type = (
+            STRATIS_FS_TYPE
+            if key_spec is None or _LEGACY_POOL is None
+            else CRYPTO_LUKS_FS_TYPE
+        )
         device_tokens = self._lb_mgr.create_devices(num_devices)
         devnodes = self._lb_mgr.device_files(device_tokens)
         key_spec = None if key_spec is None else [key_spec]
@@ -345,13 +357,16 @@ class UdevTest4(UdevTest):
 
             self.wait_for_pools(0)
             (_, (pool_object_path, _)) = create_pool(
-                random_string(5), devnodes, key_description=key_description
+                random_string(5),
+                devnodes,
+                key_description=(
+                    [(key_description, None)] if key_description is not None else None
+                ),
             )
+            self.wait_for_pools(1)
             pool_uuid = Pool.Properties.Uuid.Get(get_object(pool_object_path))
 
-            self.wait_for_pools(1)
-
-        remove_stratis_dm_devices()
+        remove_stratis_setup()
 
         self._lb_mgr.unplug(device_tokens)
         wait_for_udev(udev_wait_type, [])
@@ -369,20 +384,33 @@ class UdevTest4(UdevTest):
                 wait_for_udev(udev_wait_type, self._lb_mgr.device_files(tokens_up))
                 self.wait_for_pools(0)
 
-            ((option, unlock_uuids), exit_code, _) = Manager.Methods.UnlockPool(
-                get_object(TOP_OBJECT),
-                {
-                    "pool_uuid": pool_uuid,
-                    "unlock_method": str(EncryptionMethod.KEYRING),
-                },
-            )
-            if key_spec is None:
-                self.assertNotEqual(exit_code, StratisdErrors.OK)
-                self.assertEqual(option, False)
+            if _LEGACY_POOL is not None:
+                ((changed, _), exit_code, _) = Manager.Methods.StartPool(
+                    get_object(TOP_OBJECT),
+                    {
+                        "id": pool_uuid,
+                        "unlock_method": (True, (True, 1)),
+                        "id_type": "uuid",
+                        "key_fd": (False, 0),
+                        "remove_cache": False,
+                    },
+                )
             else:
-                self.assertEqual(exit_code, StratisdErrors.OK)
-                self.assertEqual(option, True)
-                self.assertEqual(len(unlock_uuids), num_devices - 1)
+                ((changed, _), exit_code, _) = Manager.Methods.StartPool(
+                    get_object(TOP_OBJECT),
+                    {
+                        "id": pool_uuid,
+                        "unlock_method": (True, (False, 0)),
+                        "id_type": "uuid",
+                        "key_fd": (False, 0),
+                        "remove_cache": False,
+                    },
+                )
+
+            # This should always fail because a pool cannot be successfully
+            # started without all devices present.
+            self.assertNotEqual(exit_code, StratisdErrors.OK)
+            self.assertEqual(changed, False)
 
             self.wait_for_pools(0)
 
@@ -391,27 +419,39 @@ class UdevTest4(UdevTest):
 
             wait_for_udev(udev_wait_type, self._lb_mgr.device_files(tokens_up))
 
-            ((option, unlock_uuids), exit_code, _) = Manager.Methods.UnlockPool(
-                get_object(TOP_OBJECT),
-                {
-                    "pool_uuid": pool_uuid,
-                    "unlock_method": str(EncryptionMethod.KEYRING),
-                },
-            )
+            if _LEGACY_POOL is not None:
+                ((changed, _), exit_code, message) = Manager.Methods.StartPool(
+                    get_object(TOP_OBJECT),
+                    {
+                        "id": pool_uuid,
+                        "unlock_method": (True, (True, 1)),
+                        "id_type": "uuid",
+                        "key_fd": (False, 0),
+                        "remove_cache": False,
+                    },
+                )
+            else:
+                ((changed, _), exit_code, message) = Manager.Methods.StartPool(
+                    get_object(TOP_OBJECT),
+                    {
+                        "id": pool_uuid,
+                        "unlock_method": (True, (False, 0)),
+                        "id_type": "uuid",
+                        "key_fd": (False, 0),
+                        "remove_cache": False,
+                    },
+                )
 
             if key_spec is None:
                 self.assertNotEqual(exit_code, StratisdErrors.OK)
-                self.assertEqual(option, False)
+                self.assertEqual(changed, False)
             else:
-                self.assertEqual(exit_code, StratisdErrors.OK)
-                self.assertEqual(option, True)
-                self.assertEqual(len(unlock_uuids), 1)
+                self.assertEqual(exit_code, StratisdErrors.OK, msg=message)
+                self.assertEqual(changed, True)
 
             wait_for_udev_count(num_devices)
 
             self.wait_for_pools(1)
-
-        remove_stratis_dm_devices()
 
     def test_simple_event(self):
         """
@@ -426,10 +466,6 @@ class UdevTest4(UdevTest):
         self._simple_event_test(key_spec=("test_key_desc", "test_key"))
 
 
-@skipIf(
-    int(environ.get("SKIP_DUPLICATE_NAMES_TEST", "0")) == 1,
-    "See: https://github.com/stratis-storage/stratisd/issues/2719",
-)
 class UdevTest5(UdevTest):
     """
     Test correct handling of pools with duplicate pool names.
@@ -448,7 +484,7 @@ class UdevTest5(UdevTest):
     so forth. Eventually, all pools should have been set up.
     """
 
-    def test_duplicate_pool_name(self):  # pylint: disable=too-many-locals
+    def test_duplicate_pool_name(self):  # noqa: PLR0912,PLR0915
         """
         Create more than one pool with the same name, then dynamically fix it
         :return: None
@@ -475,7 +511,15 @@ class UdevTest5(UdevTest):
                     if random.choice([True, False])
                     else None
                 )
-                create_pool(pool_name, devnodes, key_description=key_description)
+                create_pool(
+                    pool_name,
+                    devnodes,
+                    key_description=(
+                        [(key_description, None)]
+                        if key_description is not None
+                        else None
+                    ),
+                )
                 if key_description is None:
                     unencrypted_indices.append(i)
                 else:
@@ -483,7 +527,7 @@ class UdevTest5(UdevTest):
 
             pool_tokens.append(this_pool)
 
-            remove_stratis_dm_devices()
+            remove_stratis_setup()
 
             self._lb_mgr.unplug(this_pool)
 
@@ -498,12 +542,22 @@ class UdevTest5(UdevTest):
             (luks_tokens, non_luks_tokens) = (
                 [
                     dev
-                    for sublist in (pool_tokens[i] for i in encrypted_indices)
+                    for sublist in (
+                        pool_tokens[i]
+                        for i in (encrypted_indices if _LEGACY_POOL is not None else [])
+                    )
                     for dev in sublist
                 ],
                 [
                     dev
-                    for sublist in (pool_tokens[i] for i in unencrypted_indices)
+                    for sublist in (
+                        pool_tokens[i]
+                        for i in (
+                            unencrypted_indices
+                            if _LEGACY_POOL is not None
+                            else unencrypted_indices + encrypted_indices
+                        )
+                    )
                     for dev in sublist
                 ],
             )
@@ -511,22 +565,35 @@ class UdevTest5(UdevTest):
             wait_for_udev(CRYPTO_LUKS_FS_TYPE, self._lb_mgr.device_files(luks_tokens))
             wait_for_udev(STRATIS_FS_TYPE, self._lb_mgr.device_files(non_luks_tokens))
 
-            variant_pool_uuids = Manager.Properties.LockedPools.Get(
+            variant_pool_uuids = Manager.Properties.StoppedPools.Get(
                 get_object(TOP_OBJECT)
             )
 
             for pool_uuid in variant_pool_uuids:
-                ((option, _), exit_code, _) = Manager.Methods.UnlockPool(
-                    get_object(TOP_OBJECT),
-                    {
-                        "pool_uuid": pool_uuid,
-                        "unlock_method": str(EncryptionMethod.KEYRING),
-                    },
-                )
-                self.assertEqual(exit_code, StratisdErrors.OK)
-                self.assertEqual(option, True)
+                if _LEGACY_POOL is not None:
+                    Manager.Methods.StartPool(
+                        get_object(TOP_OBJECT),
+                        {
+                            "id": pool_uuid,
+                            "unlock_method": (True, (True, 1)),
+                            "id_type": "uuid",
+                            "key_fd": (False, 0),
+                            "remove_cache": False,
+                        },
+                    )
+                else:
+                    Manager.Methods.StartPool(
+                        get_object(TOP_OBJECT),
+                        {
+                            "id": pool_uuid,
+                            "unlock_method": (True, (False, 0)),
+                            "id_type": "uuid",
+                            "key_fd": (False, 0),
+                            "remove_cache": False,
+                        },
+                    )
 
-            wait_for_udev_count(len(all_tokens))
+            wait_for_udev_count(len(non_luks_tokens) + len(luks_tokens))
 
             # The number of pools should never exceed one, since all the pools
             # previously formed in the test have the same name.
@@ -536,6 +603,9 @@ class UdevTest5(UdevTest):
             # then generate synthetic add events for every loopbacked device.
             # After num_pools - 1 iterations, all pools should have been set up.
             for pool_count in range(1, num_pools):
+                variant_pool_uuids = Manager.Properties.StoppedPools.Get(
+                    get_object(TOP_OBJECT)
+                )
                 current_pools = self.wait_for_pools(pool_count)
 
                 # Rename all active pools to a randomly selected new name
@@ -544,7 +614,46 @@ class UdevTest5(UdevTest):
                         get_object(object_path), {"name": random_string(10)}
                     )
 
-                self._lb_mgr.generate_synthetic_udev_events(all_tokens, UDEV_ADD_EVENT)
+                if _LEGACY_POOL is not None:
+                    self._lb_mgr.generate_synthetic_udev_events(
+                        non_luks_tokens, UDEV_ADD_EVENT
+                    )
+                    for pool_uuid, props in variant_pool_uuids.items():
+                        if "key_description" in props:
+                            Manager.Methods.StartPool(
+                                get_object(TOP_OBJECT),
+                                {
+                                    "id": pool_uuid,
+                                    "unlock_method": (True, (True, 1)),
+                                    "id_type": "uuid",
+                                    "key_fd": (False, 0),
+                                    "remove_cache": False,
+                                },
+                            )
+                else:
+                    self._lb_mgr.generate_synthetic_udev_events(
+                        non_luks_tokens + luks_tokens, UDEV_ADD_EVENT
+                    )
+                    for pool_uuid, props in variant_pool_uuids.items():
+                        encrypted = False
+                        if "features" in props:
+                            boolean, features = props["features"]
+                            if (
+                                bool(boolean) is True
+                                and "encryption" in features
+                                and bool(features["encryption"]) is True
+                            ):
+                                encrypted = True
+                        Manager.Methods.StartPool(
+                            get_object(TOP_OBJECT),
+                            {
+                                "id": pool_uuid,
+                                "unlock_method": (encrypted, (False, 0)),
+                                "id_type": "uuid",
+                                "key_fd": (False, 0),
+                                "remove_cache": False,
+                            },
+                        )
 
                 settle()
 
@@ -552,4 +661,245 @@ class UdevTest5(UdevTest):
 
             self.wait_for_pools(num_pools)
 
-        remove_stratis_dm_devices()
+
+class UdevTest6(UdevTest):
+    """
+    A test that verifies that unencrypted pools are not set up after having been
+    stopped.
+
+    Two pools are created, Then the daemon is brought down and all Stratis
+    devicemapper devices are destroyed. The daemon is brought back up again, and it
+    is verified that the daemon has recreated the pool.
+
+    One pool is then stopped and then devicemapper devices are removed for the other.
+    The daemon is then stopped and started and only one pool should be set up.
+    """
+
+    def _simple_stop_test(self):
+        """
+        A simple test of stopping pools.
+
+        * Create two unencrypted pools
+        * Stop the daemon
+        * Remove devicemapper devices
+        * Start the daemon
+        * Ensure two pools are up
+        * Stop one pool and then the daemon
+        * Remove devicemapper devices
+        * Start the daemon
+        * Ensure only one pool is set up
+        * Ensure udev events do not cause pool to be set up
+        """
+        num_devices = 2
+        device_tokens = self._lb_mgr.create_devices(num_devices)
+        devnodes = self._lb_mgr.device_files(device_tokens)
+        pool_name1 = random_string(5)
+        pool_name2 = random_string(5)
+
+        with OptionalKeyServiceContextManager():
+            self.wait_for_pools(0)
+
+            create_pool(pool_name1, devnodes[:1])
+            create_pool(pool_name2, devnodes[1:])
+
+            self.wait_for_pools(2)
+
+        remove_stratis_setup()
+
+        with OptionalKeyServiceContextManager():
+            self.wait_for_pools(2)
+            self.assertEqual(
+                len(Manager.Properties.StoppedPools.Get(get_object(TOP_OBJECT))), 0
+            )
+
+            ((changed, _), exit_code, message) = Manager.Methods.StopPool(
+                get_object(TOP_OBJECT), {"id": pool_name1, "id_type": "name"}
+            )
+            self.assertEqual(exit_code, StratisdErrors.OK, msg=message)
+            self.assertEqual(changed, True)
+
+            self.assertEqual(
+                len(Manager.Properties.StoppedPools.Get(get_object(TOP_OBJECT))), 1
+            )
+
+        remove_stratis_setup()
+
+        with OptionalKeyServiceContextManager():
+            self.wait_for_pools(1)
+            self.assertEqual(
+                len(Manager.Properties.StoppedPools.Get(get_object(TOP_OBJECT))), 1
+            )
+            self._lb_mgr.generate_synthetic_udev_events(
+                device_tokens[:1], UDEV_ADD_EVENT
+            )
+            self.assertEqual(
+                len(Manager.Properties.StoppedPools.Get(get_object(TOP_OBJECT))), 1
+            )
+
+    def test_simple_stop(self):
+        """
+        See documentation for _simple_stop_test.
+        """
+        self._simple_stop_test()
+
+
+class UdevTest7(UdevTest):
+    """
+    A test that verifies that encrypted and unencrypted pools can be started by name.
+
+    An encrypted and unencrypted pool are created and stopped. Devices are removed
+    from both pools and starting the pool by name should fail for both pools. The
+    devices are then readded and the pools should successfully be able to be started
+    by name.
+    """
+
+    def _simple_start_by_name_test(self):
+        """
+        A simple test of stopping pools.
+
+        * Create an encrypted and unencrypted pool
+        * Stop the pools
+        * Remove devices from each pool
+        * Attempt to start by name which should fail
+        * Add the devices back
+        * Starting the pools by name should succeed
+        """
+        num_devices = 4
+        device_tokens = self._lb_mgr.create_devices(num_devices)
+        devnodes = self._lb_mgr.device_files(device_tokens)
+
+        with OptionalKeyServiceContextManager(
+            key_spec=[("testkey", "testpassword")]
+        ) as key_desc:
+            self.wait_for_pools(0)
+
+            create_pool(
+                "encrypted",
+                devnodes[:2],
+                key_description=(
+                    [(key_desc[0], None)] if key_desc[0] is not None else None
+                ),
+            )
+            create_pool("unencrypted", devnodes[2:])
+
+            self.wait_for_pools(2)
+
+            ((changed, _), exit_code, _) = Manager.Methods.StopPool(
+                get_object(TOP_OBJECT), {"id": "encrypted", "id_type": "name"}
+            )
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(changed, True)
+            ((changed, _), exit_code, message) = Manager.Methods.StopPool(
+                get_object(TOP_OBJECT), {"id": "unencrypted", "id_type": "name"}
+            )
+            self.assertEqual(exit_code, StratisdErrors.OK, msg=message)
+            self.assertEqual(changed, True)
+
+            self.wait_for_pools(0)
+
+            self.assertEqual(
+                len(Manager.Properties.StoppedPools.Get(get_object(TOP_OBJECT))), 2
+            )
+
+            self._lb_mgr.generate_synthetic_udev_events(
+                device_tokens[1:3], UDEV_REMOVE_EVENT
+            )
+            settle()
+
+            if _LEGACY_POOL is not None:
+                ((changed, _), exit_code, _) = Manager.Methods.StartPool(
+                    get_object(TOP_OBJECT),
+                    {
+                        "id": "encrypted",
+                        "unlock_method": (True, (True, 1)),
+                        "id_type": "name",
+                        "key_fd": (False, 0),
+                        "remove_cache": False,
+                    },
+                )
+            else:
+                ((changed, _), exit_code, _) = Manager.Methods.StartPool(
+                    get_object(TOP_OBJECT),
+                    {
+                        "id": "encrypted",
+                        "unlock_method": (True, (False, 0)),
+                        "id_type": "name",
+                        "key_fd": (False, 0),
+                        "remove_cache": False,
+                    },
+                )
+            self.assertFalse(changed)
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(
+                len(Manager.Properties.StoppedPools.Get(get_object(TOP_OBJECT))), 2
+            )
+
+            ((changed, _), exit_code, _) = Manager.Methods.StartPool(
+                get_object(TOP_OBJECT),
+                {
+                    "id": "unencrypted",
+                    "unlock_method": (False, (False, 0)),
+                    "id_type": "name",
+                    "key_fd": (False, 0),
+                    "remove_cache": False,
+                },
+            )
+            self.assertFalse(changed)
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(
+                len(Manager.Properties.StoppedPools.Get(get_object(TOP_OBJECT))), 2
+            )
+
+            self._lb_mgr.generate_synthetic_udev_events(
+                device_tokens[1:3], UDEV_ADD_EVENT
+            )
+            settle()
+
+            if _LEGACY_POOL is not None:
+                ((changed, _), exit_code, message) = Manager.Methods.StartPool(
+                    get_object(TOP_OBJECT),
+                    {
+                        "id": "encrypted",
+                        "unlock_method": (True, (True, 1)),
+                        "id_type": "name",
+                        "key_fd": (False, 0),
+                        "remove_cache": False,
+                    },
+                )
+            else:
+                ((changed, _), exit_code, message) = Manager.Methods.StartPool(
+                    get_object(TOP_OBJECT),
+                    {
+                        "id": "encrypted",
+                        "unlock_method": (True, (False, 0)),
+                        "id_type": "name",
+                        "key_fd": (False, 0),
+                        "remove_cache": False,
+                    },
+                )
+            self.assertTrue(changed)
+            self.assertEqual(exit_code, StratisdErrors.OK, msg=message)
+            self.assertEqual(
+                len(Manager.Properties.StoppedPools.Get(get_object(TOP_OBJECT))), 1
+            )
+            ((changed, _), exit_code, message) = Manager.Methods.StartPool(
+                get_object(TOP_OBJECT),
+                {
+                    "id": "unencrypted",
+                    "unlock_method": (False, (False, 0)),
+                    "id_type": "name",
+                    "key_fd": (False, 0),
+                    "remove_cache": False,
+                },
+            )
+            self.assertTrue(changed)
+            self.assertEqual(exit_code, StratisdErrors.OK, msg=message)
+            self.assertEqual(
+                len(Manager.Properties.StoppedPools.Get(get_object(TOP_OBJECT))), 0
+            )
+
+    def test_simple_start_by_name(self):
+        """
+        See documentation for _simple_start_by_name_test.
+        """
+        self._simple_start_by_name_test()

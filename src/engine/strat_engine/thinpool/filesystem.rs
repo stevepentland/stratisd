@@ -3,19 +3,19 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::{
-    fs::{File, OpenOptions},
-    io::{Read, Write},
+    cmp::min,
+    fs::OpenOptions,
+    io::Write,
     path::{Path, PathBuf},
-    thread::sleep,
-    time::Duration,
 };
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use data_encoding::BASE32_NOPAD;
+use retry::{delay::Fixed, retry_with_index};
 use serde_json::{Map, Value};
 
 use devicemapper::{
-    Bytes, DmDevice, DmName, DmOptions, DmUuid, Sectors, ThinDev, ThinDevId, ThinPoolDev,
+    Bytes, DevId, DmDevice, DmName, DmOptions, DmUuid, Sectors, ThinDev, ThinDevId, ThinPoolDev,
     ThinStatus,
 };
 
@@ -27,16 +27,18 @@ use nix::{
 use crate::{
     engine::{
         engine::{DumpState, Filesystem, StateDiff},
+        shared::unsigned_to_timestamp,
         strat_engine::{
-            cmd::{create_fs, set_uuid, udev_settle, xfs_growfs},
+            backstore::get_logical_sector_size,
+            cmd::{create_fs, set_uuid, xfs_growfs},
             devlinks,
-            dm::get_dm,
+            dm::{get_dm, thin_device},
             names::{format_thin_ids, ThinRole},
             serde_structs::FilesystemSave,
-            thinpool::{thinpool::DATA_LOWATER, DATA_BLOCK_SIZE},
         },
         types::{
-            ActionAvailability, FilesystemUuid, Name, PoolUuid, StratFilesystemDiff, StratisUuid,
+            ActionAvailability, Compare, Diff, FilesystemUuid, Name, PoolUuid, StratFilesystemDiff,
+            StratisUuid,
         },
     },
     stratis::{StratisError, StratisResult},
@@ -44,15 +46,14 @@ use crate::{
 
 const TEMP_MNT_POINT_PREFIX: &str = "stratis_mp_";
 
-/// Set the low water mark on the filesystem at 4 times the data low water.  The filesystem
-/// expansion check is triggered by crossing the data low water mark for the thin pool.
-pub const FILESYSTEM_LOWATER: Sectors = Sectors(4 * (DATA_LOWATER.0 * DATA_BLOCK_SIZE.0));
-
 #[derive(Debug)]
 pub struct StratFilesystem {
     thin_dev: ThinDev,
     created: DateTime<Utc>,
     used: Option<Bytes>,
+    size_limit: Option<Sectors>,
+    origin: Option<FilesystemUuid>,
+    merge_scheduled: bool,
 }
 
 fn init_used(thin_dev: &ThinDev) -> Option<Bytes> {
@@ -74,27 +75,31 @@ impl StratFilesystem {
         pool_uuid: PoolUuid,
         thinpool_dev: &ThinPoolDev,
         size: Sectors,
+        size_limit: Option<Sectors>,
         id: ThinDevId,
     ) -> StratisResult<(FilesystemUuid, StratFilesystem)> {
+        if let Some(limit) = size_limit {
+            if limit < size {
+                return Err(StratisError::Msg(format!(
+                    "Requested limit {limit} is less than requested size {size}",
+                )));
+            }
+        }
+
         let fs_uuid = FilesystemUuid::new_v4();
         let (dm_name, dm_uuid) = format_thin_ids(pool_uuid, ThinRole::Filesystem(fs_uuid));
         let mut thin_dev =
             ThinDev::new(get_dm(), &dm_name, Some(&dm_uuid), size, thinpool_dev, id)?;
 
-        if let Err(err) = create_fs(&thin_dev.devnode(), Some(StratisUuid::Fs(fs_uuid)), false) {
-            udev_settle().unwrap_or_else(|err| {
-                warn!("{}", err);
-                sleep(Duration::from_secs(5));
-            });
-            if let Err(err2) = thin_dev.destroy(get_dm(), thinpool_dev) {
-                error!(
-                    "While handling create_fs error, thin_dev.destroy() failed: {}",
-                    err2
-                );
+        if let Err(err) = create_fs(&thin_dev.devnode(), Some(StratisUuid::Fs(fs_uuid))) {
+            if let Err(err2) = retry_with_index(Fixed::from_millis(100).take(4), |i| {
+                trace!("Cleanup new thin device after failed create_fs() attempt {i}");
+                thin_dev.destroy(get_dm(), thinpool_dev)
+            }) {
+                error!("While handling create_fs error, thin_dev.destroy() failed: {err2}");
                 // This will result in a dangling DM device that will prevent
                 // the thinpool from being destroyed, and wasted space in the
                 // thinpool.
-                // TODO: Recover. But how?
             }
             return Err(err);
         }
@@ -105,6 +110,9 @@ impl StratFilesystem {
                 used: init_used(&thin_dev),
                 thin_dev,
                 created: Utc::now(),
+                size_limit,
+                origin: None,
+                merge_scheduled: false,
             },
         ))
     }
@@ -116,6 +124,8 @@ impl StratFilesystem {
         fssave: &FilesystemSave,
     ) -> StratisResult<StratFilesystem> {
         let (dm_name, dm_uuid) = format_thin_ids(pool_uuid, ThinRole::Filesystem(fssave.uuid));
+        let created = unsigned_to_timestamp(fssave.created, 0)?;
+
         let thin_dev = ThinDev::setup(
             get_dm(),
             &dm_name,
@@ -127,7 +137,10 @@ impl StratFilesystem {
         Ok(StratFilesystem {
             used: init_used(&thin_dev),
             thin_dev,
-            created: Utc.timestamp(fssave.created as i64, 0),
+            created,
+            size_limit: fssave.fs_size_limit,
+            origin: fssave.origin,
+            merge_scheduled: fssave.merge,
         })
     }
 
@@ -150,7 +163,7 @@ impl StratFilesystem {
             .collect::<PathBuf>();
             OpenOptions::new()
                 .write(true)
-                .open(&uevent_file)?
+                .open(uevent_file)?
                 .write_all(
                     format!(
                         "{} {} STRATISPOOLNAME={} STRATISFSNAME={}",
@@ -165,7 +178,7 @@ impl StratFilesystem {
         }
 
         if let Err(e) = udev_change_event(&self.thin_dev, pool_name, fs_uuid, fs_name) {
-            warn!("Failed to notify udev to perform symlink operation: {}", e);
+            warn!("Failed to notify udev to perform symlink operation: {e}");
         }
     }
 
@@ -175,6 +188,9 @@ impl StratFilesystem {
     /// Mounting a filesystem with a duplicate UUID would require special handling,
     /// so snapshot_fs_uuid is used to update the new snapshot filesystem so it has
     /// a unique UUID.
+    ///
+    /// As of the introduction of filesystem size limits, snapshots inherit the origin size limit
+    /// but the limit can be changed or removed through the API.
     #[allow(clippy::too_many_arguments)]
     pub fn snapshot(
         &self,
@@ -185,6 +201,7 @@ impl StratFilesystem {
         snapshot_fs_name: &Name,
         snapshot_fs_uuid: FilesystemUuid,
         snapshot_thin_id: ThinDevId,
+        origin_uuid: FilesystemUuid,
     ) -> StratisResult<StratFilesystem> {
         match self.thin_dev.snapshot(
             get_dm(),
@@ -216,7 +233,12 @@ impl StratFilesystem {
                         MsFlags::empty(),
                         Some("nouuid"),
                     )?;
-                    umount(tmp_dir.path())?;
+                    if let Err(e) = retry_with_index(Fixed::from_millis(100).take(2), |i| {
+                        trace!("Unmount temporary snapshot mount attempt {i}");
+                        umount(tmp_dir.path())
+                    }) {
+                        warn!("Unmounting temporary snapshot mount failed: {e}");
+                    }
                 }
 
                 set_uuid(&thin_dev.devnode(), snapshot_fs_uuid)?;
@@ -224,81 +246,128 @@ impl StratFilesystem {
                     used: init_used(&thin_dev),
                     thin_dev,
                     created: Utc::now(),
+                    size_limit: self.size_limit,
+                    origin: Some(origin_uuid),
+                    merge_scheduled: false,
                 })
             }
             Err(e) => Err(StratisError::Msg(format!(
-                "failed to create {} snapshot for {} - {}",
-                snapshot_name, snapshot_fs_name, e
+                "failed to create {snapshot_name} snapshot for {snapshot_fs_name} - {e}"
             ))),
         }
     }
 
-    /// Check if filesystem is getting full and needs to be extended.
+    /// Check the filesystem usage and determine whether it should extend
+    /// or just update. If extend, return the amount to extend.
     ///
     /// Returns:
-    /// * Some(_) if metadata should be saved.
-    /// * None if metadata should not be saved.
-    /// TODO: deal with the thindev in a Fail state.
-    pub fn check(&mut self) -> StratisResult<(bool, StratFilesystemDiff)> {
-        let mut needs_save = false;
-        let original_state = self.cached(|fs| StratFilesystemState {
-            size: fs.size(),
-            used: fs.used().ok(),
-        });
-        match self.thin_dev.status(get_dm(), DmOptions::default())? {
-            ThinStatus::Working(_) => {
-                if let Some(mount_point) = self.mount_points()?.first() {
-                    let (fs_total_bytes, fs_total_used_bytes) = fs_usage(mount_point)?;
-                    let free_bytes = fs_total_bytes - fs_total_used_bytes;
-                    if free_bytes.sectors() < FILESYSTEM_LOWATER {
-                        let old_table = self.thin_dev.table().table.clone();
-                        let mut new_table = old_table.clone();
-                        new_table.length =
-                            original_state.size.sectors() + Self::extend_size(self.thin_dev.size());
-                        self.thin_dev.set_table(get_dm(), new_table)?;
-                        if let Err(causal) = xfs_growfs(mount_point) {
-                            if let Err(rollback) = self.thin_dev.set_table(get_dm(), old_table) {
-                                return Err(StratisError::RollbackError {
-                                    causal_error: Box::new(causal),
-                                    rollback_error: Box::new(StratisError::from(rollback)),
-                                    level: ActionAvailability::NoPoolChanges,
-                                });
-                            } else {
-                                return Err(causal);
-                            }
-                        }
-                        needs_save = true;
+    /// * Some(_) if the filesystem is mounted and should be visited
+    /// * Some((_, 0)) if the filesystem does not need to be extended
+    /// * None if the filesystem is unmounted and should not be visited
+    pub fn visit_values(
+        &self,
+        no_op_remaining_size: Option<&mut Sectors>,
+    ) -> Option<(PathBuf, Sectors)> {
+        fn visit_values_fail(
+            fs: &StratFilesystem,
+            no_op_remaining_size: Option<&mut Sectors>,
+        ) -> StratisResult<Option<(PathBuf, Sectors)>> {
+            match fs.thin_dev.status(get_dm(), DmOptions::default())? {
+                ThinStatus::Working(_) => {
+                    if let Some(mount_point) = fs.mount_points()?.first() {
+                        return fs_usage(mount_point).map(
+                            |(fs_total_bytes, fs_total_used_bytes)| {
+                                Some((
+                                    mount_point.clone(),
+                                    if 2u64 * fs_total_used_bytes > fs_total_bytes {
+                                        fs.extend_size(no_op_remaining_size)
+                                    } else {
+                                        Sectors(0)
+                                    },
+                                ))
+                            },
+                        );
                     }
+                    Ok(None)
+                }
+                ThinStatus::Error => {
+                    let error_msg = format!(
+                        "Unable to get status for filesystem thin device {}",
+                        fs.thin_dev.device()
+                    );
+                    Err(StratisError::Msg(error_msg))
+                }
+                _ => Ok(None),
+            }
+        }
+
+        match visit_values_fail(self, no_op_remaining_size) {
+            Ok(mt_pt) => mt_pt,
+            Err(e) => {
+                warn!("Checking whether the filesystem should be visited failed: {e}; ignoring");
+                None
+            }
+        }
+    }
+
+    /// Handle filesystem changes while checking, including updating cached
+    /// state.
+    ///
+    /// If extend_size is 0, it is not necessary to extend the filesystem,
+    /// but the state may have changed.
+    pub fn handle_fs_changes(
+        &mut self,
+        mount_point: &Path,
+        extend_size: Sectors,
+    ) -> StratisResult<StratFilesystemDiff> {
+        let original_state = self.cached();
+
+        if extend_size > Sectors(0) {
+            let old_table = self.thin_dev.table().table.clone();
+            let mut new_table = old_table.clone();
+            new_table.length = original_state.size.sectors() + extend_size;
+            self.thin_dev.set_table(get_dm(), new_table)?;
+            if let Err(causal) = xfs_growfs(mount_point) {
+                if let Err(rollback) = self.thin_dev.set_table(get_dm(), old_table) {
+                    return Err(StratisError::RollbackError {
+                        causal_error: Box::new(causal),
+                        rollback_error: Box::new(StratisError::from(rollback)),
+                        level: ActionAvailability::NoPoolChanges,
+                    });
+                } else {
+                    return Err(causal);
                 }
             }
-            ThinStatus::Error => {
-                let error_msg = format!(
-                    "Unable to get status for filesystem thin device {}",
-                    self.thin_dev.device()
-                );
-                return Err(StratisError::Msg(error_msg));
-            }
-            _ => (),
-        };
-        Ok((
-            needs_save,
-            original_state.diff(&self.dump(|fs| StratFilesystemState {
-                used: fs.used().ok(),
-                size: fs.size(),
-            })),
-        ))
+        }
+
+        Ok(original_state.diff(&self.dump(())))
     }
 
     /// Return an extend size for the thindev under the filesystem
-    /// TODO: returning the current size will double the space provisioned to
-    /// the thin device.  We should determine if this is a reasonable value.
-    fn extend_size(current_size: Sectors) -> Sectors {
-        current_size
+    /// If no_op_remaining_size is None, then the pool allows overprovisioning.
+    fn extend_size(&self, no_op_remaining_size: Option<&mut Sectors>) -> Sectors {
+        let current_size = self.thindev_size();
+        let fs_limit_remaining_size = self.size_limit().map(|sl| sl - self.thindev_size());
+        match (no_op_remaining_size, fs_limit_remaining_size) {
+            (Some(no_op_rem_size), Some(fs_lim_rem_size)) => {
+                let extend_size = min(min(*no_op_rem_size, current_size), fs_lim_rem_size);
+                *no_op_rem_size -= extend_size;
+                extend_size
+            }
+            (Some(no_op_rem_size), None) => {
+                let extend_size = min(*no_op_rem_size, current_size);
+                *no_op_rem_size -= extend_size;
+                extend_size
+            }
+            (None, Some(fs_lim_rem_size)) => min(fs_lim_rem_size, current_size),
+            (_, _) => current_size,
+        }
     }
 
     /// Tear down the filesystem.
-    pub fn teardown(&mut self) -> StratisResult<()> {
-        self.thin_dev.teardown(get_dm())?;
+    pub fn teardown(pool_uuid: PoolUuid, fs_uuid: FilesystemUuid) -> StratisResult<()> {
+        let device = thin_device(pool_uuid, fs_uuid);
+        get_dm().device_remove(&DevId::Name(&device), DmOptions::default())?;
         Ok(())
     }
 
@@ -315,39 +384,80 @@ impl StratFilesystem {
             thin_id: self.thin_dev.id(),
             size: self.thin_dev.size(),
             created: self.created.timestamp() as u64,
+            fs_size_limit: self.size_limit,
+            origin: self.origin,
+            merge: self.merge_scheduled,
         }
     }
 
     /// Find places where this filesystem is mounted.
     fn mount_points(&self) -> StratisResult<Vec<PathBuf>> {
-        // Use major:minor values to find mounts for this filesystem
-        let major = u64::from(self.thin_dev.device().major);
-        let minor = u64::from(self.thin_dev.device().minor);
+        let device = self.thin_dev.device();
+        let majmin = format!("{}:{}", device.major, device.minor);
 
-        let mut mount_data = String::new();
-        File::open("/proc/self/mountinfo")?.read_to_string(&mut mount_data)?;
-        let parser = libmount::mountinfo::Parser::new(mount_data.as_bytes());
+        procfs::process::Process::myself()
+            .and_then(|p| p.mountinfo())
+            .map(|infos| {
+                infos.into_iter()
+                    .filter_map(|mount| (mount.majmin == majmin).then_some(mount.mount_point))
+                    .collect()
+            })
+            .map_err(|err|
+                StratisError::Msg(
+                    format!("Error while parsing /proc/self/mountinfo for mount information for filesystem {:?}: {:?}", *self, err)
+                )
+            )
+    }
 
-        let mut ret_vec = Vec::new();
-        for mp in parser {
-            match mp {
-                Ok(mount) => {
-                    if mount.major as u64 == major && mount.minor as u64 == minor {
-                        ret_vec.push(PathBuf::from(&mount.mount_point));
-                    }
-                }
-                Err(e) => {
-                    let error_msg = format!("Error during parsing {:?}: {:?}", *self, e);
-                    return Err(StratisError::Msg(error_msg));
+    pub fn set_size_limit(&mut self, limit: Option<Sectors>) -> StratisResult<bool> {
+        match limit {
+            Some(lim) if self.thindev_size() > lim => Err(StratisError::Msg(format!(
+                "Limit requested of {} is smaller than current filesystem size of {}",
+                lim,
+                self.thindev_size()
+            ))),
+            Some(_) | None => {
+                if self.size_limit == limit {
+                    Ok(false)
+                } else {
+                    self.size_limit = limit;
+                    Ok(true)
                 }
             }
         }
-
-        Ok(ret_vec)
     }
 
     pub fn thindev_size(&self) -> Sectors {
         self.thin_dev.size()
+    }
+
+    pub fn set_origin(&mut self, value: Option<FilesystemUuid>) -> bool {
+        let changed = self.origin != value;
+        self.origin = value;
+        changed
+    }
+
+    /// Set the merge scheduled value for the filesystem.
+    pub fn set_merge_scheduled(&mut self, scheduled: bool) -> StratisResult<bool> {
+        if self.merge_scheduled == scheduled {
+            Ok(false)
+        } else if scheduled && self.origin.is_none() {
+            Err(StratisError::Msg(
+                "Filesystem has no origin filesystem; can not schedule a merge".into(),
+            ))
+        } else {
+            self.merge_scheduled = scheduled;
+            Ok(true)
+        }
+    }
+
+    pub fn thin_id(&self) -> ThinDevId {
+        self.thin_dev.id()
+    }
+
+    /// Get the sector size reported by libblkid for this filesystem.
+    pub fn logical_sector_size(&self) -> StratisResult<Bytes> {
+        get_logical_sector_size(&self.devnode())
     }
 }
 
@@ -384,6 +494,18 @@ impl Filesystem for StratFilesystem {
     fn size(&self) -> Bytes {
         self.thin_dev.size().bytes()
     }
+
+    fn size_limit(&self) -> Option<Sectors> {
+        self.size_limit
+    }
+
+    fn origin(&self) -> Option<FilesystemUuid> {
+        self.origin
+    }
+
+    fn merge_scheduled(&self) -> bool {
+        self.merge_scheduled
+    }
 }
 
 /// Represents the state of the Stratis filesystem at a given moment in time.
@@ -397,21 +519,36 @@ impl StateDiff for StratFilesystemState {
 
     fn diff(&self, new_state: &Self) -> Self::Diff {
         StratFilesystemDiff {
-            size: if self.size != new_state.size {
-                Some(new_state.size)
-            } else {
-                None
-            },
-            used: if self.used != new_state.used {
-                Some(new_state.used)
-            } else {
-                None
-            },
+            size: self.size.compare(&new_state.size),
+            used: self.used.compare(&new_state.used),
+        }
+    }
+
+    fn unchanged(&self) -> Self::Diff {
+        StratFilesystemDiff {
+            size: Diff::Unchanged(self.size),
+            used: Diff::Unchanged(self.used),
         }
     }
 }
-impl DumpState for StratFilesystem {
+impl DumpState<'_> for StratFilesystem {
     type State = StratFilesystemState;
+    type DumpInput = ();
+
+    fn cached(&self) -> Self::State {
+        StratFilesystemState {
+            size: self.size(),
+            used: self.used,
+        }
+    }
+
+    fn dump(&mut self, _: Self::DumpInput) -> Self::State {
+        self.used = self.used().ok();
+        StratFilesystemState {
+            used: self.used,
+            size: self.size(),
+        }
+    }
 }
 
 /// Return total bytes allocated to the filesystem, total bytes used by data/metadata
@@ -419,6 +556,7 @@ pub fn fs_usage(mount_point: &Path) -> StratisResult<(Bytes, Bytes)> {
     let stat = statvfs(mount_point)?;
 
     // Upcast all arch-dependent variable width values to u64
+    #[allow(clippy::unnecessary_cast)]
     let (block_size, blocks, blocks_free) = (
         stat.block_size() as u64,
         stat.blocks() as u64,
@@ -430,7 +568,7 @@ pub fn fs_usage(mount_point: &Path) -> StratisResult<(Bytes, Bytes)> {
     ))
 }
 
-impl<'a> Into<Value> for &'a StratFilesystem {
+impl Into<Value> for &StratFilesystem {
     fn into(self) -> Value {
         let mut json = Map::new();
         json.insert(
@@ -443,6 +581,24 @@ impl<'a> Into<Value> for &'a StratFilesystem {
                 self.used()
                     .map(|v| v.to_string())
                     .unwrap_or_else(|_| "Unavailable".to_string()),
+            ),
+        );
+        json.insert(
+            "size_limit".to_string(),
+            Value::from(
+                self.size_limit
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "Not set".to_string()),
+            ),
+        );
+        json.insert(
+            "origin".to_string(),
+            Value::from(
+                self.origin
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "Not set".to_string()),
             ),
         );
         Value::from(json)

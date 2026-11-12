@@ -22,7 +22,7 @@ pub const SUBSYSTEM_BLOCK: &str = "block";
 
 /// Make an enumerator for enumerating block devices. Return an error if there
 /// was any udev-related error.
-pub fn block_enumerator(context: &libudev::Context) -> libudev::Result<libudev::Enumerator<'_>> {
+pub fn block_enumerator(context: &libudev::Context) -> libudev::Result<libudev::Enumerator> {
     let mut enumerator = libudev::Enumerator::new(context)?;
     enumerator.match_subsystem(SUBSYSTEM_BLOCK)?;
     Ok(enumerator)
@@ -32,27 +32,13 @@ pub fn block_enumerator(context: &libudev::Context) -> libudev::Result<libudev::
 /// Returns None if no udev property found for the given property name.
 /// Returns an error if the value of the property can not be converted to
 /// a string using the standard conversion for this OS.
-pub fn get_udev_property<T: AsRef<OsStr>>(
+pub fn get_udev_property<T: AsRef<OsStr> + fmt::Display>(
     device: &UdevEngineDevice,
     property_name: T,
-) -> Option<StratisResult<String>>
-where
-    T: fmt::Display,
-{
-    device.property_value(&property_name).map(|value| {
-        value
-            .to_str()
-            .ok_or_else(|| {
-                StratisError::Msg(
-                    format!(
-                        "Unable to convert udev property value with key {} to a string, lossy value is {}",
-                        property_name,
-                        value.to_string_lossy()
-                    ),
-                )
-            })
-            .map(|value| value.into())
-    })
+) -> Option<StratisResult<String>> {
+    device
+        .property_value(&property_name)
+        .map(|opt| opt.map(|s| s.to_string()))
 }
 
 /// Returns true if udev indicates that the device is a multipath member
@@ -175,6 +161,6 @@ where
     Ok(enumerator
         .scan_devices()?
         .filter(|dev| dev.is_initialized())
-        .find(|x| x.devnode().map_or(false, |d| **device_path == *d))
+        .find(|x| x.devnode().is_some_and(|d| **device_path == *d))
         .map(|ref d| f(&UdevEngineDevice::from(d))))
 }

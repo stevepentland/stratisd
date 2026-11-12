@@ -2,45 +2,44 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+use std::sync::Arc;
+
 use tokio::{select, sync::mpsc::UnboundedReceiver, task::JoinHandle};
 
 use crate::{
-    engine::{Engine, LockableEngine, UdevEngineEvent},
+    engine::{Engine, UdevEngineEvent},
     jsonrpc::run_server,
     stratis::{StratisError, StratisResult},
 };
 
-fn handle_udev<E>(
-    engine: LockableEngine<E>,
+fn handle_udev(
+    engine: Arc<dyn Engine>,
     mut recv: UnboundedReceiver<UdevEngineEvent>,
-) -> JoinHandle<()>
-where
-    E: 'static + Engine,
-{
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let udev_event = match recv.recv().await {
-                Some(u) => u,
+            let mut events = Vec::new();
+            match recv.recv().await {
+                Some(u) => events.push(u),
                 None => {
                     error!("Channel from udev handler to JSON RPC handler was shut");
                     return;
                 }
             };
-            let mut lock = engine.lock().await;
+            while let Ok(event) = recv.try_recv() {
+                events.push(event);
+            }
             // Return value should be ignored as JSON RPC does not keep a record
             // of data structure information in the IPC layer.
-            let _ = lock.handle_event(&udev_event);
+            let _ = engine.handle_events(events).await;
         }
     })
 }
 
-pub async fn setup<E>(
-    engine: LockableEngine<E>,
+pub async fn setup(
+    engine: Arc<dyn Engine>,
     recv: UnboundedReceiver<UdevEngineEvent>,
-) -> StratisResult<()>
-where
-    E: 'static + Engine,
-{
+) -> StratisResult<()> {
     let mut udev_join = handle_udev(engine.clone(), recv);
     let mut server_join = run_server(engine);
 

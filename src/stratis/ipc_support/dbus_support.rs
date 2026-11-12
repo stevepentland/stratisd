@@ -9,81 +9,40 @@
 // and one for the unsupported version. Also, Default is not really a
 // helpful concept here.
 
-use tokio::{
-    select,
-    sync::{
-        broadcast::Sender,
-        mpsc::{UnboundedReceiver, UnboundedSender},
-    },
-    task::{self, spawn_blocking},
-};
+use std::sync::Arc;
+
+use tokio::{select, task};
 
 use crate::{
-    dbus_api::{create_dbus_handlers, DbusAction},
-    engine::{Engine, LockableEngine, UdevEngineEvent},
+    dbus::UdevHandler,
+    engine::Engine,
     stratis::{StratisError, StratisResult},
 };
 
 /// Set up the cooperating D-Bus threads.
-pub async fn setup<E>(
-    engine: LockableEngine<E>,
-    receiver: UnboundedReceiver<UdevEngineEvent>,
-    trigger: Sender<()>,
-    tree_channel: (
-        UnboundedSender<DbusAction<E>>,
-        UnboundedReceiver<DbusAction<E>>,
-    ),
-) -> StratisResult<()>
-where
-    E: 'static + Engine,
-{
-    let (mut conn, mut udev, mut tree) = spawn_blocking(move || {
-        create_dbus_handlers(engine.clone(), receiver, trigger, tree_channel)
-            .map(|(conn, udev, tree)| {
-                let mutex_lock = engine.blocking_lock();
-                for (pool_name, pool_uuid, pool) in mutex_lock.pools() {
-                    udev.register_pool(&pool_name, pool_uuid, pool)
-                }
-                info!("D-Bus API is available");
-                (conn, udev, tree)
-            })
-            .map_err(StratisError::from)
-    })
-    .await
-    .map_err(StratisError::from)
-    .and_then(|res| res)?;
-
-    let mut tree_handle = task::spawn_blocking(move || {
-        if let Err(e) = tree.process_dbus_actions() {
-            error!(
-                "Failed to process D-Bus object path addition or removal: {}; \
-                exiting D-Bus thread",
-                e,
-            );
+pub async fn setup(engine: Arc<dyn Engine>, mut udev: UdevHandler) -> StratisResult<()> {
+    {
+        let pools = engine.pools().await;
+        for (_, pool_uuid, _) in pools.iter() {
+            if let Err(e) = udev.register_pool(*pool_uuid).await {
+                warn!("Failed to register existing pools: {e}");
+            }
         }
-    });
-    let mut conn_handle = task::spawn_blocking(move || conn.process_dbus_requests());
+    }
+    info!("D-Bus API is available");
+
     let mut udev_handle = task::spawn(async move {
         loop {
-            if let Err(e) = udev.handle_udev_event().await {
-                error!(
-                    "Failed to process udev event in the D-Bus layer: {}; exiting D-Bus thread",
-                    e,
-                );
-                return;
+            trace!("Starting D-Bus udev event handling");
+            if let Err(e) = udev.process_udev_events().await {
+                warn!("Failed to handle udev events: {e}");
+                break;
             }
+            trace!("Finished D-Bus udev event handling");
         }
     });
 
     select! {
-        res = &mut tree_handle => {
-            error!("The tree handling thread exited...");
-            res.map_err(StratisError::from)
-        }
-        res = &mut conn_handle => {
-            error!("The D-Bus request thread exited...");
-            res.map_err(StratisError::from).and_then(|res| res)
-        }
         res = &mut udev_handle => {
             error!("The udev processing thread exited...");
             res.map_err(StratisError::from)

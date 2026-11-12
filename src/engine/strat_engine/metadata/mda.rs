@@ -8,24 +8,28 @@ use std::{
 };
 
 use byteorder::{ByteOrder, LittleEndian};
-use chrono::{DateTime, TimeZone, Utc};
-use crc::crc32;
+use chrono::{DateTime, Utc};
+use crc::{Crc, CRC_32_ISCSI};
 
 use devicemapper::Bytes;
 
 use crate::{
-    engine::strat_engine::{
-        metadata::sizes::{mda_size, MDADataSize, MDARegionSize, MDASize},
-        writing::SyncAll,
+    engine::{
+        shared::unsigned_to_timestamp,
+        strat_engine::{
+            metadata::sizes::{mda_size, MDADataSize, MDARegionSize, MDASize},
+            writing::SyncAll,
+        },
     },
     stratis::{StratisError, StratisResult},
 };
 
 const STRAT_REGION_HDR_VERSION: u8 = 1;
 const STRAT_METADATA_VERSION: u8 = 1;
+const CASTAGNOLI: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 
 /// Manages the MDA regions which hold the variable length metadata.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MDARegions {
     /// The size of a single MDA region. The MDAHeader occupies the
     /// first few bytes of its region, the rest is available for the
@@ -124,7 +128,7 @@ impl MDARegions {
         let mut get_mda = |index: usize| -> StratisResult<Option<MDAHeader>> {
             load_a_region(index)
                 .map_err(|e| {
-                    warn!("First MDA header is invalid: {}", e);
+                    warn!("First MDA header is invalid: {e}");
                     e
                 })
                 .or_else(|_| load_a_region(index + mda_size::NUM_PRIMARY_MDA_REGIONS))
@@ -160,17 +164,15 @@ impl MDARegions {
         let used = Bytes::from(data.len());
         let max_available = self.max_data_size().bytes();
         if used > max_available {
-            let err_msg = format!(
-                "metadata length {} exceeds region available {}",
-                used, max_available
-            );
+            let err_msg =
+                format!("metadata length {used} exceeds region available {max_available}");
             return Err(StratisError::Msg(err_msg));
         }
 
         let header = MDAHeader {
             last_updated: *time,
             used: MetaDataSize::new(used),
-            data_crc: crc32::checksum_castagnoli(data),
+            data_crc: CASTAGNOLI.checksum(data),
         };
         let hdr_buf = header.to_buf();
 
@@ -236,7 +238,7 @@ impl MDARegions {
         match (&self.mda_headers[0], &self.mda_headers[1]) {
             (&None, _) => 0,
             (_, &None) => 1,
-            (&Some(ref mda0), &Some(ref mda1)) => match mda0.last_updated.cmp(&mda1.last_updated) {
+            (Some(mda0), Some(mda1)) => match mda0.last_updated.cmp(&mda1.last_updated) {
                 Ordering::Less => 0,
                 Ordering::Equal | Ordering::Greater => 1,
             },
@@ -262,9 +264,9 @@ impl MDARegions {
     #[cfg(test)]
     /// An invariant on MDARegions structs.
     /// 1. If an MDAHeader in the regions is not None, then its used
-    /// attribute must be greater than 0.
+    ///    attribute must be greater than 0.
     /// 2. If an MDAHeader in the regions is not None, then its used
-    /// attribute must be no greater than the region allocated for it.
+    ///    attribute must be no greater than the region allocated for it.
     pub fn invariant(&self) {
         let space_for_data = self.region_size.data_size().bytes();
         for mda in self.mda_headers.iter().flatten() {
@@ -278,7 +280,7 @@ impl MDARegions {
 /// A type representing the actual size of variable length metadata written within this metadata
 /// region. This amount must never be greater than the size of the region allocated for the variable
 /// length metadata, which has `MDADataSize` type.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MetaDataSize(Bytes);
 
 impl MetaDataSize {
@@ -291,7 +293,7 @@ impl MetaDataSize {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct MDAHeader {
     last_updated: DateTime<Utc>,
 
@@ -302,40 +304,24 @@ pub struct MDAHeader {
     data_crc: u32,
 }
 
-// Implementing Default explicitly because DateTime<Utc> does not implement
-// Default. Implement Default for MDAHeader in order to overwrite MDAHeader
-// locations with values that represent no MDAHeader but where the data has
-// the correct CRC, so can be read without an error.
-impl Default for MDAHeader {
-    fn default() -> MDAHeader {
-        MDAHeader {
-            last_updated: Utc.timestamp(0, 0),
-            used: MetaDataSize::new(Bytes(0)),
-            data_crc: 0,
-        }
-    }
-}
-
 impl MDAHeader {
     /// Parse a valid MDAHeader from buf.
     /// If the amount used by the variable length metadata is 0, return None,
     /// as this means that no variable length metadata has been written.
-    fn parse_buf(buf: &[u8; mda_size::_MDA_REGION_HDR_SIZE]) -> Option<MDAHeader> {
+    fn parse_buf(buf: &[u8; mda_size::_MDA_REGION_HDR_SIZE]) -> Option<StratisResult<MDAHeader>> {
         match LittleEndian::read_u64(&buf[8..16]) {
             0 => None,
-            used => {
-                let secs = LittleEndian::read_u64(&buf[16..24]);
-
-                // Signed cast is safe, highest order bit of each value
-                // read is guaranteed to be 0.
-                assert!(secs <= std::i64::MAX as u64);
-
-                Some(MDAHeader {
+            used => Some(
+                unsigned_to_timestamp(
+                    LittleEndian::read_u64(&buf[16..24]),
+                    LittleEndian::read_u32(&buf[24..28]),
+                )
+                .map(|last_updated| MDAHeader {
                     used: MetaDataSize::new(Bytes::from(used)),
-                    last_updated: Utc.timestamp(secs as i64, LittleEndian::read_u32(&buf[24..28])),
+                    last_updated,
                     data_crc: LittleEndian::read_u32(&buf[4..8]),
-                })
-            }
+                }),
+            ),
         }
     }
 
@@ -344,7 +330,7 @@ impl MDAHeader {
     /// Return None if there is no MDAHeader to be read. This is detected if the
     /// timestamp region in the buffer is 0.
     fn from_buf(buf: &[u8; mda_size::_MDA_REGION_HDR_SIZE]) -> StratisResult<Option<MDAHeader>> {
-        if LittleEndian::read_u32(&buf[..4]) != crc32::checksum_castagnoli(&buf[4..]) {
+        if LittleEndian::read_u32(&buf[..4]) != CASTAGNOLI.checksum(&buf[4..]) {
             return Err(StratisError::Msg("MDA region header CRC".into()));
         }
 
@@ -353,20 +339,18 @@ impl MDAHeader {
         let hdr_version = buf[28];
         if hdr_version != STRAT_REGION_HDR_VERSION {
             return Err(StratisError::Msg(format!(
-                "Unknown region header version: {}",
-                hdr_version
+                "Unknown region header version: {hdr_version}"
             )));
         }
 
         let metadata_version = buf[29];
         if metadata_version != STRAT_METADATA_VERSION {
             return Err(StratisError::Msg(format!(
-                "Unknown metadata version: {}",
-                metadata_version
+                "Unknown metadata version: {metadata_version}"
             )));
         }
 
-        Ok(MDAHeader::parse_buf(buf))
+        MDAHeader::parse_buf(buf).transpose()
     }
 
     fn to_buf(&self) -> [u8; mda_size::_MDA_REGION_HDR_SIZE] {
@@ -385,7 +369,7 @@ impl MDAHeader {
         buf[28] = STRAT_REGION_HDR_VERSION;
         buf[29] = STRAT_METADATA_VERSION;
 
-        let buf_crc = crc32::checksum_castagnoli(&buf[4..mda_size::_MDA_REGION_HDR_SIZE]);
+        let buf_crc = CASTAGNOLI.checksum(&buf[4..mda_size::_MDA_REGION_HDR_SIZE]);
         LittleEndian::write_u32(&mut buf[..4], buf_crc);
 
         buf
@@ -403,7 +387,7 @@ impl MDAHeader {
 
         f.read_exact(&mut data_buf)?;
 
-        if self.data_crc != crc32::checksum_castagnoli(&data_buf) {
+        if self.data_crc != CASTAGNOLI.checksum(&data_buf) {
             return Err(StratisError::Msg("MDA region data CRC".into()));
         }
 
@@ -422,7 +406,7 @@ mod tests {
 
     // 82102984128000 in decimal, approx 17 million years
     const UTC_TIMESTAMP_SECS_BOUND: i64 = 0x777_9beb_9f00;
-    const UTC_TIMESTAMP_NSECS_BOUND: u32 = 2_000_000_000u32;
+    const UTC_TIMESTAMP_NSECS_BOUND: u32 = 1_000_000_000u32;
 
     #[test]
     /// Verify that default MDAHeader is all 0s except for CRC and versions.
@@ -473,9 +457,9 @@ mod tests {
                       nsec in 0..UTC_TIMESTAMP_NSECS_BOUND) {
 
             let header = MDAHeader {
-                last_updated: Utc.timestamp(sec, nsec),
+                last_updated: DateTime::from_timestamp(sec, nsec).expect("values are correct by construction"),
                 used: MetaDataSize::new(Bytes::from(data.len())),
-                data_crc: crc32::checksum_castagnoli(data),
+                data_crc: CASTAGNOLI.checksum(data),
             };
             let buf = header.to_buf();
             let mda1 = MDAHeader::from_buf(&buf).unwrap().unwrap();
@@ -497,7 +481,7 @@ mod tests {
         let header = MDAHeader {
             last_updated: Utc::now(),
             used: MetaDataSize::new(Bytes::from(data.len())),
-            data_crc: crc32::checksum_castagnoli(&data),
+            data_crc: CASTAGNOLI.checksum(&data),
         };
         let mut buf = header.to_buf();
         LittleEndian::write_u32(&mut buf[..4], 0u32);

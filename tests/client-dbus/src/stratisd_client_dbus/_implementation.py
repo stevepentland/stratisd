@@ -15,10 +15,8 @@
 Classes to implement dbus interface.
 """
 
-# isort: STDLIB
 import xml.etree.ElementTree as ET
 
-# isort: FIRSTPARTY
 from dbus_client_gen import managed_object_class, mo_query_builder
 from dbus_python_client_gen import make_class
 
@@ -42,7 +40,7 @@ blockdevs = mo_query_builder(_BLOCKDEV_SPEC)
 MOPool = managed_object_class("MOPool", _POOL_SPEC)
 MOBlockDev = managed_object_class("MOBlockDev", _BLOCKDEV_SPEC)
 
-TIME_OUT = 120  # In seconds
+TIME_OUT = 360  # In seconds
 
 ObjectManager = make_class(
     "ObjectManager",

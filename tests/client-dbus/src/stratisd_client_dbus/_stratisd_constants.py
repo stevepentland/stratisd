@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Representing stratisd contants.
+Representing stratisd constants.
 """
 
-# isort: STDLIB
 from enum import Enum, IntEnum
 
 
@@ -50,6 +49,5 @@ class EncryptionMethod(Enum):
     KEYRING = "keyring"
     CLEVIS = "clevis"
 
-    # pylint: disable=invalid-str-returned
     def __str__(self):
         return self.value

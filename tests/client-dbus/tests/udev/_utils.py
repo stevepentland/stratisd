@@ -15,7 +15,8 @@
 Support for testing udev device discovery.
 """
 
-# isort: STDLIB
+import json
+import logging
 import os
 import random
 import signal
@@ -25,27 +26,39 @@ import time
 import unittest
 from tempfile import NamedTemporaryFile
 
-# isort: THIRDPARTY
 import dbus
 import psutil
 import pyudev
+from tenacity import (
+    RetryError,
+    Retrying,
+    retry_if_exception_type,
+    retry_if_not_result,
+    stop_after_attempt,
+    stop_after_delay,
+    wait_fixed,
+)
 
-# isort: LOCAL
 from stratisd_client_dbus import (
     Blockdev,
     Manager,
+    MOBlockDev,
     MOPool,
     ObjectManager,
+    Pool,
     StratisdErrors,
+    blockdevs,
     get_object,
     pools,
 )
 from stratisd_client_dbus._constants import TOP_OBJECT
 
-from ._dm import _get_stratis_devices, remove_stratis_setup
+from ._dm import remove_stratis_setup
 from ._loopback import LoopBackDevices
 
 _STRATISD = os.environ["STRATISD"]
+STRATISD = _STRATISD
+_LEGACY_POOL = os.environ.get("LEGACY_POOL")
 
 CRYPTO_LUKS_FS_TYPE = "crypto_LUKS"
 STRATIS_FS_TYPE = "stratis"
@@ -57,45 +70,133 @@ def random_string(length):
     :param length: Length of random part of string
     :return: String
     """
-    return "stratis_{0}".format(
-        "".join(random.choice(string.ascii_uppercase) for _ in range(length))
-    )
+    return f"stratis_{''.join(random.choice(string.ascii_uppercase) for _ in range(length))}"
 
 
-def create_pool(name, devices, *, key_description=None, clevis_info=None):
+def create_pool(  # noqa: PLR0915
+    name, devices, *, key_description=None, clevis_info=None, overprovision=True
+):
     """
     Creates a stratis pool.
     :param name:    Name of pool
     :param devices:  Devices to use for pool
-    :param key_description: optional key description
-    :type key_description: str or NoneType
+    :param key_description: optional key descriptions and token slots
+    :type key_description: list of tuples
     :param clevis_info: clevis information, pin and config
-    :type clevis_info: pair of str * str
-    :return: result of the CreatePool D-Bus method call if it succeeds
+    :type clevis_info: list of tuples
+    :return: result of pool create if operation succeeds
     :rtype: bool * str * list of str
     :raises RuntimeError: if pool is not created
     """
-    (result, exit_code, error_str) = Manager.Methods.CreatePool(
-        get_object(TOP_OBJECT),
-        {
-            "name": name,
-            "redundancy": (True, 0),
-            "devices": devices,
-            "key_desc": (False, "")
-            if key_description is None
-            else (True, key_description),
-            "clevis_info": (False, ("", ""))
-            if clevis_info is None
-            else (True, clevis_info),
-        },
-    )
 
-    if exit_code == StratisdErrors.OK:
+    def create_legacy_pool():
+        newly_created = False
+
+        if len(get_pools(name)) == 0:
+            cmdline = [_LEGACY_POOL, name] + devices
+            if key_description is not None:
+                if len(key_description) > 1:
+                    raise RuntimeError(
+                        "Can only provide one key description to legacy pools"
+                    )
+                (kd, _) = key_description[0]
+                cmdline.extend(["--key-desc", kd])
+            if clevis_info is not None:
+                if len(clevis_info) > 1:
+                    raise RuntimeError(
+                        "Can only provide one Clevis info to legacy pools"
+                    )
+                (pin, (tang_url, thp), _) = clevis_info[0]
+                cmdline.extend(["--clevis", pin])
+                if pin == "tang":
+                    cmdline.extend(["--tang-url", tang_url])
+                    if thp is None:
+                        cmdline.append("--trust-url")
+                    else:
+                        cmdline.extend(["--thumbprint", thp])
+
+            with subprocess.Popen(cmdline, text=True, stdin=subprocess.PIPE) as process:
+                process.stdin.write(  # pyright: ignore [reportOptionalMemberAccess]
+                    f"Yes{os.linesep}"
+                )
+                process.stdin.flush()  # pyright: ignore [reportOptionalMemberAccess]
+                process.wait()
+                if process.returncode != 0:
+                    raise RuntimeError(
+                        f"Unable to create a pool {name} with devices {devices}: {process.stderr}"
+                    )
+
+            newly_created = True
+
+        i = 0
+        while get_pools(name) == [] and i < 5:  # noqa PLR2004
+            i += 1
+            time.sleep(1)
+        (pool_object_path, _) = next(iter(get_pools(name)))
+        bd_object_paths = [op for op, _ in get_blockdevs(pool_object_path)]
+
+        return (newly_created, (pool_object_path, bd_object_paths))
+
+    def create_v2_pool():
+        dbus_key_descriptions = []
+        for kd, slot in key_description if key_description is not None else []:
+            if slot is None:
+                dbus_slot = (False, 0)
+            else:
+                dbus_slot = (True, slot)
+
+            dbus_key_descriptions.append((dbus_slot, kd))
+
+        dbus_clevis_infos = []
+        for pin, (tang_url, thp), slot in (
+            clevis_info if clevis_info is not None else []
+        ):
+            if slot is None:
+                dbus_slot = (False, 0)
+            else:
+                dbus_slot = (True, slot)
+
+            if pin == "tang":
+                config = json.dumps(
+                    {"url": tang_url, "stratis:tang:trust_url": True}
+                    if thp is None
+                    else {"url": tang_url, "thp": thp}
+                )
+            else:
+                raise RuntimeError(
+                    "Currently only Tang is supported for Clevis in the test infrastructure"
+                )
+
+            dbus_clevis_infos.append((dbus_slot, pin, config))
+
+        (result, exit_code, error_str) = Manager.Methods.CreatePool(
+            get_object(TOP_OBJECT),
+            {
+                "name": name,
+                "devices": devices,
+                "key_desc": dbus_key_descriptions,
+                "clevis_info": dbus_clevis_infos,
+                "journal_size": (False, 0),
+                "tag_spec": (False, ""),
+                "allocate_superblock": (False, False),
+            },
+        )
+
+        if exit_code != StratisdErrors.OK:
+            raise RuntimeError(
+                f"Unable to create a pool {name} with devices {devices}: {error_str}"
+            )
+
         return result
 
-    raise RuntimeError(
-        "Unable to create a pool %s with devices %s: %s" % (name, devices, error_str)
+    (newly_created, (pool_object_path, bd_object_paths)) = (
+        create_v2_pool() if _LEGACY_POOL is None else create_legacy_pool()
     )
+
+    if not overprovision:
+        Pool.Properties.Overprovisioning.Set(get_object(pool_object_path), False)
+
+    return (newly_created, (pool_object_path, bd_object_paths))
 
 
 def get_pools(name=None):
@@ -114,6 +215,27 @@ def get_pools(name=None):
     return [
         (op, MOPool(info))
         for op, info in pools(props={} if name is None else {"Name": name}).search(
+            managed_objects
+        )
+    ]
+
+
+def get_blockdevs(pool=None):
+    """
+    Get the device nodes belonging to the pool indicated by parent.
+
+    :param parent: list of object paths representing blockdevs
+    :type blockdev_object_paths: list of str
+    :return: list of blockdev information found
+    :rtype: list of (str * MOBlockdev)
+    """
+    managed_objects = ObjectManager.Methods.GetManagedObjects(
+        get_object(TOP_OBJECT), {}
+    )
+
+    return [
+        (op, MOBlockDev(info))
+        for op, info in blockdevs(props={} if pool is None else {"Pool": pool}).search(
             managed_objects
         )
     ]
@@ -139,7 +261,7 @@ def settle():
     :return: None
     """
     time.sleep(2)
-    subprocess.check_call(["udevadm", "settle"])
+    subprocess.check_call(["/usr/bin/udevadm", "settle"])
 
 
 def wait_for_udev_count(expected_num):
@@ -155,29 +277,31 @@ def wait_for_udev_count(expected_num):
     :return: None
     :raises RuntimeError: if unexpected number of device nodes is found
     """
-    found_num = None
-
     context = pyudev.Context()
-    end_time = time.time() + 10.0
 
-    while time.time() < end_time and not expected_num == found_num:
-        found_num = len(
-            frozenset(
-                [
-                    x.device_node
-                    for x in context.list_devices(
-                        subsystem="block", ID_FS_TYPE=STRATIS_FS_TYPE
+    try:
+        for attempt in Retrying(
+            retry=retry_if_not_result(lambda found_num: found_num == expected_num),
+            stop=stop_after_delay(20),
+            wait=wait_fixed(1),
+        ):
+            with attempt:
+                found_num = len(
+                    frozenset(
+                        [
+                            x.device_node
+                            for x in context.list_devices(
+                                subsystem="block", ID_FS_TYPE=STRATIS_FS_TYPE
+                            )
+                        ]
                     )
-                ]
-            )
-        )
-        time.sleep(1)
-
-    if expected_num != found_num:
+                )
+            attempt.retry_state.set_result(found_num)
+    except RetryError as err:
         raise RuntimeError(
-            "Found unexpected number of devnodes: expected number: %s != found number: %s"
-            % (expected_num, found_num)
-        )
+            "Found unexpected number of devnodes: expected number: "
+            f"{expected_num} != found number: {err.last_attempt.result()}"
+        ) from err
 
 
 def wait_for_udev(fs_type, expected_paths):
@@ -192,25 +316,32 @@ def wait_for_udev(fs_type, expected_paths):
     :raises RuntimeError: if unexpected device nodes are found
     """
     expected_devnodes = frozenset((os.path.realpath(x) for x in expected_paths))
-    found_devnodes = None
-
     context = pyudev.Context()
-    end_time = time.time() + 10.0
 
-    while time.time() < end_time and not expected_devnodes == found_devnodes:
-        found_devnodes = frozenset(
-            [
-                x.device_node
-                for x in context.list_devices(subsystem="block", ID_FS_TYPE=fs_type)
-            ]
-        )
-        time.sleep(1)
+    try:
+        for attempt in Retrying(
+            retry=retry_if_not_result(
+                lambda found_devnodes: found_devnodes == expected_devnodes
+            ),
+            stop=stop_after_delay(10),
+            wait=wait_fixed(1),
+        ):
+            with attempt:
+                found_devnodes = frozenset(
+                    [
+                        x.device_node
+                        for x in context.list_devices(
+                            subsystem="block", ID_FS_TYPE=fs_type
+                        )
+                    ]
+                )
+            attempt.retry_state.set_result(found_devnodes)
 
-    if expected_devnodes != found_devnodes:
+    except RetryError as err:
         raise RuntimeError(
-            "Found unexpected devnodes: expected devnodes: %s != found_devnodes: %s"
-            % (", ".join(expected_devnodes), ", ".join(found_devnodes))
-        )
+            f"Found unexpected devnodes: expected devnodes: {', '.join(expected_devnodes)} "
+            f"!= found_devnodes: {', '.join(err.last_attempt.result())}"
+        ) from err
 
 
 def processes(name):
@@ -227,23 +358,14 @@ def processes(name):
             pass
 
 
-def remove_stratis_dm_devices():
-    """
-    Remove Stratis device mapper devices, fail with a runtime error if
-    some have been missed.
-    :raises RuntimeError: if some devices are remaining
-    """
-    remove_stratis_setup()
-    if _get_stratis_devices() != []:
-        raise RuntimeError("Some devices were not removed")
-
-
 class _Service:
     """
     Start and stop stratisd.
     """
 
-    # pylint: disable=consider-using-with
+    def __init__(self):
+        self._service = None
+
     def start_service(self):
         """
         Starts the stratisd service if it is not already started. Verifies
@@ -253,42 +375,33 @@ class _Service:
 
         settle()
 
-        if list(processes("stratisd")) != []:
+        if next(processes("stratisd"), None) is not None:
             raise RuntimeError("A stratisd process is already running")
 
         service = subprocess.Popen(
-            [_STRATISD],
-            universal_newlines=True,
+            [x for x in _STRATISD.split(" ") if x != ""], text=True
         )
 
-        dbus_interface_present = False
-        limit = time.time() + 120.0
-        while (
-            time.time() <= limit
-            and not dbus_interface_present
-            and service.poll() is None
-        ):
-            try:
-                get_object(TOP_OBJECT)
-                dbus_interface_present = True
-            except dbus.exceptions.DBusException:
-                time.sleep(0.5)
+        try:
+            for attempt in Retrying(
+                retry=(retry_if_exception_type(dbus.exceptions.DBusException)),
+                stop=stop_after_delay(120),
+                wait=wait_fixed(0.5),
+                reraise=True,
+            ):
+                if service.poll() is not None:
+                    raise RuntimeError(
+                        f"Daemon unexpectedly exited with exit code {service.returncode}"
+                    )
 
-        time.sleep(1)
-        if service.poll() is not None:
+                with attempt:
+                    get_object(TOP_OBJECT)
+        except dbus.exceptions.DBusException as err:
             raise RuntimeError(
-                "Daemon unexpectedly exited with %s, stdout: %s, stderr: %s"
-                % (
-                    service.returncode,
-                    service.stdout.readlines(),
-                    service.stderr.readlines(),
-                )
-            )
+                "No D-Bus interface for stratisd found although stratisd appears to be running"
+            ) from err
 
-        if not dbus_interface_present:
-            raise RuntimeError("No D-Bus interface for stratisd found")
-
-        self._service = service  # pylint: disable=attribute-defined-outside-init
+        self._service = service
         return self
 
     def stop_service(self):
@@ -296,9 +409,12 @@ class _Service:
         Stops the stratisd daemon previously spawned.
         :return: None
         """
+        if self._service is None:
+            return
+
         self._service.send_signal(signal.SIGINT)
-        self._service.wait()
-        if list(processes("stratisd")) != []:
+        self._service.wait(timeout=30)
+        if next(processes("stratisd"), None) is not None:
             raise RuntimeError("Failed to stop stratisd service")
 
 
@@ -326,39 +442,34 @@ class KernelKey:
         :raises RuntimeError: if setting a key in the keyring through stratisd
                               fails
         """
-        for (key_desc, key_data) in self._key_descs:
+        for key_desc, key_data in self._key_descs:
             with NamedTemporaryFile(mode="w") as temp_file:
                 temp_file.write(key_data)
                 temp_file.flush()
 
-                with open(temp_file.name, "r") as fd_for_dbus:
+                with open(temp_file.name, "r", encoding="utf-8") as fd_for_dbus:
                     (_, return_code, message) = Manager.Methods.SetKey(
                         get_object(TOP_OBJECT),
-                        {
-                            "key_desc": key_desc,
-                            "key_fd": fd_for_dbus.fileno(),
-                        },
+                        {"key_desc": key_desc, "key_fd": fd_for_dbus.fileno()},
                     )
 
                 if return_code != StratisdErrors.OK:
                     raise RuntimeError(
-                        "Setting a key using stratisd failed with an error: %s"
-                        % message
+                        f"Setting a key using stratisd failed with an error: {message}"
                     )
 
         return [desc for (desc, _) in self._key_descs]
 
     def __exit__(self, exception_type, exception_value, traceback):
         try:
-            for (key_desc, _) in reversed(self._key_descs):
+            for key_desc, _ in reversed(self._key_descs):
                 (_, return_code, message) = Manager.Methods.UnsetKey(
                     get_object(TOP_OBJECT), {"key_desc": key_desc}
                 )
 
                 if return_code != StratisdErrors.OK:
                     raise RuntimeError(
-                        "Unsetting the key using stratisd failed with an error: %s"
-                        % message
+                        f"Unsetting the key using stratisd failed with an error: {message}"
                     )
 
         except RuntimeError as rexc:
@@ -393,7 +504,7 @@ class OptionalKeyServiceContextManager:
         """
         Initialize a context manager with an optional list of keys
         :param key_spec: Key description and data for kernel keys to be added
-        :type key_spec: list of (str, bytes) or NoneType
+        :type key_spec: list of (str, str) or NoneType
         """
         self._ctxt_manager = ServiceContextManager()
         self._keys = KernelKey([]) if key_spec is None else KernelKey(key_spec)
@@ -428,31 +539,69 @@ class UdevTest(unittest.TestCase):
         """
         stratisds = list(processes("stratisd"))
         for process in stratisds:
+            logging.warning("stratisd process %s still running, terminating", process)
             process.terminate()
-        psutil.wait_procs(stratisds)
+        (_, alive) = psutil.wait_procs(stratisds, timeout=10)
+        for process in alive:
+            logging.warning(
+                "stratisd process %s did not respond to terminate signal, killing",
+                process,
+            )
+            process.kill()
 
-        remove_stratis_dm_devices()
+        remove_stratis_setup()
         self._lb_mgr.destroy_all()
 
     def wait_for_pools(self, expected_num, *, name=None):
         """
         Returns a list of all pools found by GetManagedObjects, or a list
         of pools with names matching the specified name, if passed.
+        Tries multiple times to get the list of pools via GetManagedObjects
+        call. Catches the D-Bus error, just in case there are strange behaviors
+        on the test machine, but re-raises the exception if still failing after
+        tries. Uses a count instead of a timer, because the D-Bus call
+        has a built in timer of its own. Still sleeps after each try in case
+        the reason the expected number does not match the real number is that
+        the pools have not been brought up yet.
         :param int expected_num: the number of pools expected
         :param name: filter for pool name
         :type name: str or NoneType
         :return: list of pool information found
         :rtype: list of (str * MOPool)
         """
-        found_num = None
+        try:
+            known_pools = None
+            for attempt in Retrying(
+                retry=(
+                    retry_if_exception_type(dbus.exceptions.DBusException)
+                    | retry_if_not_result(
+                        lambda known_pools: (
+                            known_pools is not None and len(known_pools) == expected_num
+                        )
+                    )
+                ),
+                wait=wait_fixed(3),
+                stop=stop_after_attempt(expected_num + 1),
+                reraise=True,
+            ):
+                with attempt:
+                    known_pools = get_pools(name=name)
+                    attempt.retry_state.set_result(known_pools)
+        except dbus.exceptions.DBusException as err:
+            raise RuntimeError(
+                "Failed to obtain any information about pools from the D-Bus"
+            ) from err
+        except RetryError:
+            pass
 
-        end_time = time.time() + 10.0
-
-        while time.time() < end_time and not expected_num == found_num:
-            known_pools = get_pools(name=name)
-            found_num = len(known_pools)
-            time.sleep(1)
-
-        self.assertEqual(found_num, expected_num)
+        # At this point, it is not known whether the number of pools is more,
+        # fewer, or equal to the number of pools expected. It is only known
+        # that the D-Bus is returning a result. If the number of pools is
+        # equal to the number of pools expected, that may be due to timing,
+        # and be about to change. So, regardless, try to get the pools one
+        # more time and verify the correct count.
+        time.sleep(3)
+        known_pools = get_pools(name=name)
+        self.assertEqual(len(known_pools), expected_num)
 
         return known_pools
